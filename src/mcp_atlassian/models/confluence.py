@@ -11,6 +11,7 @@ Key models:
 - ConfluenceSearchResult: Container for Confluence search (CQL) results
 - ConfluenceComment: Page and inline comments
 - ConfluenceVersion: Content versioning information
+- ConfluenceAttachment: Attachment information and metadata
 
 Usage examples:
 
@@ -493,3 +494,112 @@ class ConfluenceSearchResult(ApiModel, TimestampMixin):
                 self.total_size,
             )
         return self
+
+
+class ConfluenceAttachment(ApiModel, TimestampMixin):
+    """
+    Model representing a Confluence attachment.
+
+    This model includes the metadata for a Confluence attachment,
+    such as file name, size, media type, and version information.
+    """
+
+    id: str = CONFLUENCE_DEFAULT_ID
+    title: str = EMPTY_STRING
+    type: str = "attachment"
+    status: str = "current"
+    file_name: str = EMPTY_STRING
+    file_size: int = 0
+    media_type: str = EMPTY_STRING
+    comment: str | None = None
+    created: str = EMPTY_STRING
+    updated: str = EMPTY_STRING
+    creator: ConfluenceUser | None = None
+    version: ConfluenceVersion | None = None
+
+    @classmethod
+    def from_api_response(cls, data: dict[str, Any], **kwargs: Any) -> "ConfluenceAttachment":
+        """
+        Create a ConfluenceAttachment from a Confluence API response.
+
+        Args:
+            data: The attachment data from the Confluence API
+            **kwargs: Additional keyword arguments
+                base_url: The base URL of the Confluence instance
+
+        Returns:
+            A ConfluenceAttachment instance
+        """
+        if not data:
+            return cls()
+
+        # Extract file name from title or metadata
+        file_name = data.get("title", "")
+
+        # Extract media type from metadata
+        media_type = ""
+        if metadata := data.get("metadata", {}):
+            media_type = metadata.get("mediaType", "")
+
+        # Extract comment from metadata
+        comment = None
+        if metadata := data.get("metadata", {}):
+            comment = metadata.get("comment")
+
+        # Extract file size if available
+        file_size = 0
+        if extensions := data.get("extensions", {}):
+            if media_info := extensions.get("mediaExtensions", {}):
+                file_size = media_info.get("fileSize", 0)
+
+        # Extract creator information
+        creator = None
+        if creator_data := data.get("by", {}):
+            creator = ConfluenceUser.from_api_response(creator_data)
+
+        # Extract version information
+        version = None
+        if version_data := data.get("version", {}):
+            version = ConfluenceVersion.from_api_response(version_data)
+
+        # Extract timestamps
+        created = data.get("created", "")
+        updated = data.get("when", "")  # Sometimes in 'when' field
+        if not updated:
+            version_data = data.get("version", {})
+            updated = version_data.get("when", "")
+
+        return cls(
+            id=data.get("id", CONFLUENCE_DEFAULT_ID),
+            title=data.get("title", EMPTY_STRING),
+            type=data.get("type", "attachment"),
+            status=data.get("status", "current"),
+            file_name=file_name,
+            file_size=file_size,
+            media_type=media_type,
+            comment=comment,
+            created=created,
+            updated=updated,
+            creator=creator,
+            version=version,
+        )
+
+    def to_simplified_dict(self) -> dict[str, Any]:
+        """
+        Convert the attachment to a simplified dictionary.
+
+        Returns:
+            A dictionary with simplified attachment data
+        """
+        return {
+            "id": self.id,
+            "title": self.title,
+            "file_name": self.file_name,
+            "file_size": self.file_size,
+            "media_type": self.media_type,
+            "comment": self.comment,
+            "created": self.created,
+            "updated": self.updated,
+            "creator": self.creator.to_simplified_dict() if self.creator else None,
+            "version": self.version.to_simplified_dict() if self.version else None,
+        }

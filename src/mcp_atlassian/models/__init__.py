@@ -11,6 +11,7 @@ from .base import ApiModel, TimestampMixin
 
 # Confluence models
 from .confluence import (
+    ConfluenceAttachment,
     ConfluenceComment,
     ConfluencePage,
     ConfluenceSearchResult,
@@ -90,4 +91,5 @@ __all__ = [
     "ConfluenceComment",
     "ConfluenceVersion",
     "ConfluenceSearchResult",
+    "ConfluenceAttachment",
 ]

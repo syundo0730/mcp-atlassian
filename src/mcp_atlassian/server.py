@@ -517,7 +517,146 @@ async def list_tools() -> list[Tool]:
                             "required": ["page_id"],
                         },
                     ),
-                ]
+                    Tool(
+                    name="confluence_upload_attachment",
+                    description="Upload an attachment to a Confluence page",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "Confluence page ID to attach the file to",
+                            },
+                            "file_path": {
+                                "type": "string",
+                                "description": "Path to the file to upload",
+                            },
+                            "comment": {
+                                "type": "string",
+                                "description": "Optional comment for the attachment",
+                            },
+                            "minor_edit": {
+                                "type": "boolean",
+                                "description": "Whether this is a minor edit",
+                                "default": False,
+                            },
+                        },
+                        "required": ["page_id", "file_path"],
+                    },
+                ),
+                Tool(
+                    name="confluence_get_attachments",
+                    description="Get attachments from a Confluence page",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "Confluence page ID to get attachments from",
+                            },
+                            "start": {
+                                "type": "number",
+                                "description": "Starting index for pagination",
+                                "default": 0,
+                            },
+                            "limit": {
+                                "type": "number",
+                                "description": "Maximum number of attachments to return (1-100)",
+                                "default": 50,
+                                "minimum": 1,
+                                "maximum": 100,
+                            },
+                        },
+                        "required": ["page_id"],
+                    },
+                ),
+                
+                Tool(
+                    name="confluence_add_attachment_to_page",
+                    description="Add an existing attachment to a Confluence page content",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "Confluence page ID to add the attachment to",
+                            },
+                            "attachment_filename": {
+                                "type": "string",
+                                "description": "Filename of the attachment to add",
+                            },
+                            "display_type": {
+                                "type": "string",
+                                "description": "How to display the attachment ('image', 'video', or 'file')",
+                                "default": "image",
+                                "enum": ["image", "video", "file"],
+                            },
+                            "height": {
+                                "type": "number",
+                                "description": "Optional height for the attachment display",
+                            },
+                            "width": {
+                                "type": "number",
+                                "description": "Optional width for the attachment display",
+                            },
+                            "alt_text": {
+                                "type": "string",
+                                "description": "Optional alt text for the attachment (for images)",
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Optional title for the attachment",
+                            },
+                        },
+                        "required": ["page_id", "attachment_filename"],
+                    },
+                ),
+                
+                Tool(
+                    name="confluence_upload_and_add_to_page",
+                    description="Upload an attachment and add it to a Confluence page content in one operation",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "Confluence page ID to add the attachment to",
+                            },
+                            "file_path": {
+                                "type": "string",
+                                "description": "Path to the file to upload",
+                            },
+                            "display_type": {
+                                "type": "string",
+                                "description": "How to display the attachment ('auto', 'image', 'video', or 'file')",
+                                "default": "auto",
+                                "enum": ["auto", "image", "video", "file"],
+                            },
+                            "height": {
+                                "type": "number",
+                                "description": "Optional height for the attachment display",
+                            },
+                            "width": {
+                                "type": "number",
+                                "description": "Optional width for the attachment display",
+                            },
+                            "alt_text": {
+                                "type": "string",
+                                "description": "Optional alt text for the attachment (for images)",
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Optional title for the attachment",
+                            },
+                            "comment": {
+                                "type": "string",
+                                "description": "Optional comment for the attachment",
+                            },
+                        },
+                        "required": ["page_id", "file_path"],
+                    },
+                ),
+            ]
             )
 
     # Add Jira tools if Jira is configured
@@ -1199,6 +1338,59 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                         ),
                     )
                 ]
+
+        elif name == "confluence_upload_attachment":
+            if not ctx or not ctx.confluence:
+                raise ValueError("Confluence is not configured.")
+
+            page_id = arguments.get("page_id")
+            file_path = arguments.get("file_path")
+            comment = arguments.get("comment")
+            minor_edit = arguments.get("minor_edit", False)
+
+            if not page_id or not file_path:
+                raise ValueError("Both page_id and file_path are required.")
+
+            attachment = ctx.confluence.upload_attachment(
+                page_id=page_id,
+                file_path=file_path,
+                comment=comment,
+                minor_edit=minor_edit
+            )
+
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(attachment.to_simplified_dict(), indent=2, ensure_ascii=False),
+                )
+            ]
+
+        elif name == "confluence_get_attachments":
+            if not ctx or not ctx.confluence:
+                raise ValueError("Confluence is not configured.")
+
+            page_id = arguments.get("page_id")
+            start = int(arguments.get("start", 0))
+            limit = min(int(arguments.get("limit", 50)), 100)
+
+            if not page_id:
+                raise ValueError("page_id is required.")
+
+            attachments = ctx.confluence.get_attachments(
+                page_id=page_id,
+                start=start,
+                limit=limit
+            )
+
+            # Format results using the to_simplified_dict method
+            attachment_results = [attachment.to_simplified_dict() for attachment in attachments]
+
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(attachment_results, indent=2, ensure_ascii=False),
+                )
+            ]
 
         # Jira operations
         elif name == "jira_get_issue" and ctx and ctx.jira:
