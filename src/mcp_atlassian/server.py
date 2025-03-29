@@ -565,6 +565,24 @@ async def list_tools() -> list[Tool]:
                             "required": ["page_id"],
                         },
                     ),
+                    Tool(
+                        name="confluence_delete_attachment",
+                        description="Delete an attachment from a Confluence page by filename",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "page_id": {
+                                    "type": "string",
+                                    "description": "Confluence page ID the attachment belongs to",
+                                },
+                                "filename": {
+                                    "type": "string",
+                                    "description": "Filename of the attachment to delete",
+                                },
+                            },
+                            "required": ["page_id", "filename"],
+                        },
+                    ),
                 ]
             )
 
@@ -1296,6 +1314,39 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 TextContent(
                     type="text",
                     text=json.dumps(attachment_results, indent=2, ensure_ascii=False),
+                )
+            ]
+
+        elif name == "confluence_delete_attachment":
+            if not ctx or not ctx.confluence:
+                raise ValueError("Confluence is not configured.")
+
+            # Write operation - check read-only mode
+            if read_only:
+                return [
+                    TextContent(
+                        type="text",
+                        text="Operation 'confluence_delete_attachment' is not available in read-only mode.",
+                    )
+                ]
+
+            page_id = arguments.get("page_id")
+            filename = arguments.get("filename")
+
+            if not page_id or not filename:
+                raise ValueError("Both page_id and filename are required.")
+
+            success = ctx.confluence.delete_attachment_by_filename(
+                page_id=page_id, filename=filename
+            )
+
+            result = {
+                "success": success,
+                "message": f"Attachment '{filename}' on page {page_id} {'deleted successfully' if success else 'deletion failed'}",
+            }
+            return [
+                TextContent(
+                    type="text", text=json.dumps(result, indent=2, ensure_ascii=False)
                 )
             ]
 
