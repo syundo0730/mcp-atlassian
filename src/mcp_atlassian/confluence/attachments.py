@@ -28,7 +28,6 @@ class AttachmentsMixin(ConfluenceClient):
             page_id: The ID of the page to attach the file to
             file_path: Path to the file to upload
             comment: Optional comment for the attachment
-            minor_edit: Whether this is a minor edit
 
         Returns:
             ConfluenceAttachment model containing the attachment data
@@ -47,7 +46,7 @@ class AttachmentsMixin(ConfluenceClient):
 
         try:
             result = self.confluence.attach_file(
-                filename=file_path.name,
+                filename=str(file_path),
                 page_id=page_id,
                 comment=comment,
             )
@@ -111,25 +110,4 @@ class AttachmentsMixin(ConfluenceClient):
 
         except Exception as e:
             logger.error(f"Error deleting attachment {filename}: {str(e)}")
-            return False
-
-    def delete_attachment_by_id(self, attachment_id: str, version: str) -> bool:
-        """
-        Delete an attachment from Confluence.
-
-        Args:
-            attachment_id: The ID of the attachment to delete
-
-        Returns:
-            True if the attachment was deleted successfully, False otherwise
-        """
-        try:
-            self.confluence.delete_attachment_by_id(
-                attachment_id=attachment_id,
-                version=version,
-            )
-            return True
-
-        except Exception as e:
-            logger.error(f"Error deleting attachment {attachment_id}: {str(e)}")
             return False
