@@ -406,8 +406,175 @@ class TestJiraIssue:
         assert len(issue.labels) == 0
         assert len(issue.comments) == 0
 
+    def test_find_custom_field_by_name(self):
+        """Test the _find_custom_field_by_name method with different field patterns."""
+        # Test with a simple fields dictionary
+        fields = {
+            "customfield_10014": "EPIC-123",
+            "customfield_10011": "Epic Name Test",
+            "customfield_10000": "Another value",
+            "schema": {
+                "fields": {
+                    "customfield_10014": {"name": "Epic Link", "type": "string"},
+                    "customfield_10011": {"name": "Epic Name", "type": "string"},
+                    "customfield_10000": {"name": "Custom Field", "type": "string"},
+                }
+            },
+        }
+
+        # Check we can find Epic Link field by name
+        result = JiraIssue._find_custom_field_by_name(fields, ["Epic Link"])
+        assert result == "EPIC-123"
+
+        # Check we can find Epic Name field by name
+        result = JiraIssue._find_custom_field_by_name(fields, ["Epic Name"])
+        assert result == "Epic Name Test"
+
+        # Check case insensitivity
+        result = JiraIssue._find_custom_field_by_name(fields, ["epic link"])
+        assert result == "EPIC-123"
+
+        # Check pattern matching
+        result = JiraIssue._find_custom_field_by_name(fields, ["epic-link", "epiclink"])
+        assert result == "EPIC-123"
+
+        # Check non-existent field
+        result = JiraIssue._find_custom_field_by_name(fields, ["Non Existent Field"])
+        assert result is None
+
+        # Test with empty fields dictionary
+        result = JiraIssue._find_custom_field_by_name({}, ["Epic Link"])
+        assert result is None
+
+        # Test with None fields
+        result = JiraIssue._find_custom_field_by_name(None, ["Epic Link"])
+        assert result is None
+
+    def test_epic_field_extraction_different_field_ids(self):
+        """Test finding epic fields with different customfield IDs."""
+        # Create a test issue with different field IDs than the common ones
+        test_data = {
+            "id": "12345",
+            "key": "PROJ-123",
+            "fields": {
+                "summary": "Test Issue",
+                "customfield_20100": "EPIC-456",  # Epic Link with non-standard ID
+                "customfield_20200": "My Epic Name",  # Epic Name with non-standard ID
+                "schema": {
+                    "fields": {
+                        "customfield_20100": {"name": "Epic Link", "type": "string"},
+                        "customfield_20200": {"name": "Epic Name", "type": "string"},
+                    }
+                },
+            },
+        }
+
+        issue = JiraIssue.from_api_response(test_data)
+
+        # The class should find the fields by name
+        assert issue.epic_key == "EPIC-456"
+        assert issue.epic_name == "My Epic Name"
+
+    def test_epic_field_extraction_fallback(self):
+        """Test using common field names without relying on metadata."""
+        # Create test data without schema information
+        test_data = {
+            "id": "12345",
+            "key": "PROJ-123",
+            "fields": {
+                "summary": "Test Issue",
+                "customfield_10014": "EPIC-456",  # Common Epic Link ID
+                "customfield_10011": "My Epic Name",  # Common Epic Name ID
+            },
+        }
+
+        # Monkeypatch the _find_custom_field_by_name method to return values for these fields
+        # This simulates finding these fields without using schema or names method
+        original_method = JiraIssue._find_custom_field_by_name
+        try:
+
+            def mocked_find_field(fields, name_patterns):
+                if (
+                    "Epic Link" in name_patterns
+                    or "epic-link" in name_patterns
+                    or "epiclink" in name_patterns
+                ):
+                    return "EPIC-456"
+                if (
+                    "Epic Name" in name_patterns
+                    or "epic-name" in name_patterns
+                    or "epicname" in name_patterns
+                ):
+                    return "My Epic Name"
+                return None
+
+            JiraIssue._find_custom_field_by_name = staticmethod(mocked_find_field)
+
+            issue = JiraIssue.from_api_response(test_data)
+
+            # The class should use the mocked method
+            assert issue.epic_key == "EPIC-456"
+            assert issue.epic_name == "My Epic Name"
+        finally:
+            # Restore the original method
+            JiraIssue._find_custom_field_by_name = staticmethod(original_method)
+
+    def test_epic_field_extraction_advanced_patterns(self):
+        """Test finding epic fields using various naming patterns."""
+        # Create test data with different field naming patterns
+        test_data = {
+            "id": "12345",
+            "key": "PROJ-123",
+            "fields": {
+                "summary": "Test Issue",
+                "customfield_12345": "EPIC-456",
+                "customfield_67890": "Epic Name Value",
+                "schema": {
+                    "fields": {
+                        "customfield_12345": {
+                            "name": "Epic-Link Field",
+                            "type": "string",
+                        },
+                        "customfield_67890": {"name": "EpicName", "type": "string"},
+                    }
+                },
+            },
+        }
+
+        issue = JiraIssue.from_api_response(test_data)
+
+        # The class should match the fields using pattern matching
+        assert issue.epic_key == "EPIC-456"
+        assert issue.epic_name == "Epic Name Value"
+
+    def test_fields_with_names_method(self):
+        """Test using the names() method to find fields."""
+
+        # Create mock fields object that has a names() method
+        class MockFields(dict):
+            def names(self):
+                return {
+                    "customfield_55555": "Epic Link",
+                    "customfield_66666": "Epic Name",
+                }
+
+        fields = MockFields(
+            {"customfield_55555": "EPIC-789", "customfield_66666": "Special Epic Name"}
+        )
+
+        # Test direct method call
+        result = JiraIssue._find_custom_field_by_name(fields, ["Epic Link"])
+        assert result == "EPIC-789"
+
+        # Now test through from_api_response
+        test_data = {"id": "12345", "key": "PROJ-123", "fields": fields}
+
+        issue = JiraIssue.from_api_response(test_data)
+        assert issue.epic_key == "EPIC-789"
+        assert issue.epic_name == "Special Epic Name"
+
     def test_to_simplified_dict(self, jira_issue_data):
-        """Test converting JiraIssue to a simplified dictionary."""
+        """Test converting a JiraIssue to a simplified dictionary."""
         issue = JiraIssue.from_api_response(jira_issue_data)
 
         simplified = issue.to_simplified_dict()
@@ -431,18 +598,12 @@ class TestJiraIssue:
         elif isinstance(simplified["status"], dict):
             assert simplified["status"]["name"] == "In Progress"
 
-        # Check issue type - could be under "type" or "issue_type"
-        assert "type" in simplified or "issue_type" in simplified
-        if "type" in simplified:
-            if isinstance(simplified["type"], str):
-                assert simplified["type"] == "Task"
-            elif isinstance(simplified["type"], dict):
-                assert simplified["type"]["name"] == "Task"
-        elif "issue_type" in simplified:
-            if isinstance(simplified["issue_type"], str):
-                assert simplified["issue_type"] == "Task"
-            elif isinstance(simplified["issue_type"], dict):
-                assert simplified["issue_type"]["name"] == "Task"
+        # Check issue type - should be under "issuetype" in the default fields
+        assert "issuetype" in simplified
+        if isinstance(simplified["issuetype"], str):
+            assert simplified["issuetype"] == "Task"
+        elif isinstance(simplified["issuetype"], dict):
+            assert simplified["issuetype"]["name"] == "Task"
 
         # Check priority
         assert "priority" in simplified
@@ -455,10 +616,119 @@ class TestJiraIssue:
         assert "assignee" in simplified
         assert "reporter" in simplified
 
-        # Check that arrays are included
+        # Test with "*all" to get all fields
+        issue = JiraIssue.from_api_response(jira_issue_data, requested_fields="*all")
+        simplified = issue.to_simplified_dict()
+
+        # Check that arrays are included with "*all"
         assert "labels" in simplified
         assert "comments" in simplified
         assert len(simplified["comments"]) > 0
+
+    def test_jira_issue_with_custom_fields(self):
+        """Test JiraIssue handling of custom fields."""
+        # Create test data with custom fields
+        issue_data = {
+            "id": "10001",
+            "key": "TEST-123",
+            "fields": {
+                "summary": "Test issue",
+                "customfield_10001": "Simple string value",
+                "customfield_10002": {"value": "Option value"},
+                "customfield_10003": [{"value": "Item 1"}, {"value": "Item 2"}],
+            },
+        }
+
+        # Test with no requested fields (should include only essential fields)
+        issue = JiraIssue.from_api_response(issue_data)
+        simplified = issue.to_simplified_dict()
+
+        # Check standard fields
+        assert simplified["key"] == "TEST-123"
+        assert simplified["summary"] == "Test issue"
+
+        # Check custom fields not included by default
+        assert "customfield_10001" not in simplified
+        assert "customfield_10002" not in simplified
+        assert "customfield_10003" not in simplified
+
+        # Test with specific requested fields as string
+        issue = JiraIssue.from_api_response(
+            issue_data, requested_fields="summary,customfield_10001"
+        )
+        simplified = issue.to_simplified_dict()
+
+        # Check only requested fields are included
+        assert "key" in simplified  # key is always included
+        assert "summary" in simplified
+        assert "customfield_10001" in simplified
+        assert "customfield_10002" not in simplified
+
+        # Test with specific requested fields as list
+        issue = JiraIssue.from_api_response(
+            issue_data, requested_fields=["key", "customfield_10002"]
+        )
+        simplified = issue.to_simplified_dict()
+
+        # Check only requested fields are included (plus key which is always included)
+        assert "key" in simplified
+        assert "customfield_10002" in simplified
+        assert "summary" not in simplified
+        assert "customfield_10001" not in simplified
+
+        # Test with *all as requested field
+        issue = JiraIssue.from_api_response(issue_data, requested_fields="*all")
+        simplified = issue.to_simplified_dict()
+
+        # Check all fields are included
+        assert "key" in simplified
+        assert "summary" in simplified
+        assert "customfield_10001" in simplified
+        assert "customfield_10002" in simplified
+        assert "customfield_10003" in simplified
+
+    def test_jira_issue_with_default_fields(self):
+        """Test that JiraIssue returns only essential fields by default."""
+        # Create test data with many fields
+        issue_data = {
+            "id": "10001",
+            "key": "TEST-123",
+            "fields": {
+                "summary": "Test issue",
+                "description": "Description",
+                "status": {"name": "Open"},
+                "assignee": {"displayName": "Test User"},
+                "reporter": {"displayName": "Reporter User"},
+                "priority": {"name": "Medium"},
+                "created": "2023-01-01T00:00:00.000+0000",
+                "updated": "2023-01-02T00:00:00.000+0000",
+                "issuetype": {"name": "Task"},
+                "customfield_10001": "Custom value",
+                "customfield_10002": {"value": "Option value"},
+            },
+        }
+
+        # Test with default (no requested_fields)
+        issue = JiraIssue.from_api_response(issue_data)
+        simplified = issue.to_simplified_dict()
+
+        # Should include essential fields
+        assert "key" in simplified
+        assert "summary" in simplified
+        assert "description" in simplified
+        assert "status" in simplified
+
+        # Should not include custom fields
+        assert "customfield_10001" not in simplified
+        assert "customfield_10002" not in simplified
+
+        # Test with "*all"
+        issue = JiraIssue.from_api_response(issue_data, requested_fields="*all")
+        simplified = issue.to_simplified_dict()
+
+        # Should include everything
+        assert "customfield_10001" in simplified
+        assert "customfield_10002" in simplified
 
 
 class TestJiraSearchResult:

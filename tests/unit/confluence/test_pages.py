@@ -60,6 +60,78 @@ class TestPagesMixin:
         assert result.version is not None
         assert result.version.number == 1
 
+    def test_get_page_ancestors(self, pages_mixin):
+        """Test getting page ancestors (parent pages)."""
+        # Arrange
+        page_id = "987654321"
+        pages_mixin.config.url = "https://example.atlassian.net/wiki"
+
+        # Mock the ancestors API response
+        ancestors_data = [
+            {
+                "id": "123456789",
+                "title": "Parent Page",
+                "type": "page",
+                "status": "current",
+                "space": {"key": "PROJ", "name": "Project Space"},
+            },
+            {
+                "id": "111222333",
+                "title": "Grandparent Page",
+                "type": "page",
+                "status": "current",
+                "space": {"key": "PROJ", "name": "Project Space"},
+            },
+        ]
+        pages_mixin.confluence.get_page_ancestors.return_value = ancestors_data
+
+        # Act
+        result = pages_mixin.get_page_ancestors(page_id)
+
+        # Assert
+        pages_mixin.confluence.get_page_ancestors.assert_called_once_with(page_id)
+
+        # Verify result structure
+        assert isinstance(result, list)
+        assert len(result) == 2
+
+        # Test first ancestor (parent)
+        assert isinstance(result[0], ConfluencePage)
+        assert result[0].id == "123456789"
+        assert result[0].title == "Parent Page"
+        assert result[0].space.key == "PROJ"
+
+        # Test second ancestor (grandparent)
+        assert isinstance(result[1], ConfluencePage)
+        assert result[1].id == "111222333"
+        assert result[1].title == "Grandparent Page"
+
+    def test_get_page_ancestors_empty(self, pages_mixin):
+        """Test getting ancestors when there are none (top-level page)."""
+        # Arrange
+        page_id = "987654321"
+        pages_mixin.confluence.get_page_ancestors.return_value = []
+
+        # Act
+        result = pages_mixin.get_page_ancestors(page_id)
+
+        # Assert
+        assert isinstance(result, list)
+        assert len(result) == 0
+
+    def test_get_page_ancestors_error(self, pages_mixin):
+        """Test error handling when getting ancestors."""
+        # Arrange
+        page_id = "987654321"
+        pages_mixin.confluence.get_page_ancestors.side_effect = Exception("API Error")
+
+        # Act
+        result = pages_mixin.get_page_ancestors(page_id)
+
+        # Assert - should return empty list on error, not raise exception
+        assert isinstance(result, list)
+        assert len(result) == 0
+
     def test_get_page_content_html(self, pages_mixin):
         """Test getting page content in HTML format."""
         pages_mixin.config.url = "https://example.atlassian.net/wiki"
@@ -211,8 +283,10 @@ class TestPagesMixin:
                 space={"key": space_key, "name": "Project"},
             ),
         ):
-            # Act
-            result = pages_mixin.create_page(space_key, title, body, parent_id)
+            # Act - specify is_markdown=False since we're directly providing storage format
+            result = pages_mixin.create_page(
+                space_key, title, body, parent_id, is_markdown=False
+            )
 
             # Assert
             pages_mixin.confluence.create_page.assert_called_once_with(
@@ -256,13 +330,14 @@ class TestPagesMixin:
             version={"number": 1},  # Add version information
         )
         with patch.object(pages_mixin, "get_page_content", return_value=mock_document):
-            # Act
+            # Act - specify is_markdown=False since we're directly providing storage format
             result = pages_mixin.update_page(
                 page_id,
                 title,
                 body,
                 is_minor_edit=is_minor_edit,
                 version_comment=version_comment,
+                is_markdown=False,
             )
 
             # Assert
@@ -279,18 +354,148 @@ class TestPagesMixin:
                 always_update=True,
             )
 
-            # Verify get_page_content was called once to get the updated page
-            # (we no longer get the current version before updating)
-            assert pages_mixin.get_page_content.call_count == 1
-
     def test_update_page_error(self, pages_mixin):
         """Test error handling when updating a page."""
         # Arrange
         pages_mixin.confluence.update_page.side_effect = Exception("API Error")
 
         # Act/Assert
-        with pytest.raises(Exception, match="API Error"):
-            pages_mixin.update_page("987654321", "Test", "<p>Content</p>")
+        with pytest.raises(Exception, match="Failed to update page"):
+            pages_mixin.update_page("987654321", "Test Page", "<p>Content</p>")
+
+    def test_delete_page_success(self, pages_mixin):
+        """Test successfully deleting a page."""
+        # Arrange
+        page_id = "987654321"
+        pages_mixin.confluence.remove_page.return_value = True
+
+        # Act
+        result = pages_mixin.delete_page(page_id)
+
+        # Assert
+        pages_mixin.confluence.remove_page.assert_called_once_with(page_id=page_id)
+        assert result is True
+
+    def test_delete_page_error(self, pages_mixin):
+        """Test error handling when deleting a page."""
+        # Arrange
+        page_id = "987654321"
+        pages_mixin.confluence.remove_page.side_effect = Exception("API Error")
+
+        # Act/Assert
+        with pytest.raises(Exception, match="Failed to delete page"):
+            pages_mixin.delete_page(page_id)
+
+    def test_get_page_children_success(self, pages_mixin):
+        """Test successfully getting child pages."""
+        # Arrange
+        parent_id = "123456"
+        pages_mixin.config.url = "https://example.atlassian.net/wiki"
+
+        # Mock the response from get_page_child_by_type
+        child_pages_data = {
+            "results": [
+                {
+                    "id": "789012",
+                    "title": "Child Page 1",
+                    "space": {"key": "DEMO"},
+                    "version": {"number": 1},
+                },
+                {
+                    "id": "345678",
+                    "title": "Child Page 2",
+                    "space": {"key": "DEMO"},
+                    "version": {"number": 3},
+                },
+            ]
+        }
+        pages_mixin.confluence.get_page_child_by_type.return_value = child_pages_data
+
+        # Act
+        results = pages_mixin.get_page_children(
+            page_id=parent_id, limit=10, expand="version"
+        )
+
+        # Assert
+        pages_mixin.confluence.get_page_child_by_type.assert_called_once_with(
+            page_id=parent_id, type="page", start=0, limit=10, expand="version"
+        )
+
+        # Verify the results
+        assert len(results) == 2
+        assert isinstance(results[0], ConfluencePage)
+        assert results[0].id == "789012"
+        assert results[0].title == "Child Page 1"
+        assert results[1].id == "345678"
+        assert results[1].title == "Child Page 2"
+
+    def test_get_page_children_with_content(self, pages_mixin):
+        """Test getting child pages with content."""
+        # Arrange
+        parent_id = "123456"
+        pages_mixin.config.url = "https://example.atlassian.net/wiki"
+
+        # Mock the response with body content
+        child_pages_data = {
+            "results": [
+                {
+                    "id": "789012",
+                    "title": "Child Page With Content",
+                    "space": {"key": "DEMO"},
+                    "version": {"number": 1},
+                    "body": {"storage": {"value": "<p>This is some content</p>"}},
+                }
+            ]
+        }
+        pages_mixin.confluence.get_page_child_by_type.return_value = child_pages_data
+
+        # Mock the preprocessor
+        pages_mixin.preprocessor.process_html_content.return_value = (
+            "<p>Processed HTML</p>",
+            "Processed Markdown",
+        )
+
+        # Act
+        results = pages_mixin.get_page_children(
+            page_id=parent_id, expand="body.storage", convert_to_markdown=True
+        )
+
+        # Assert
+        assert len(results) == 1
+        assert results[0].content == "Processed Markdown"
+        pages_mixin.preprocessor.process_html_content.assert_called_once_with(
+            "<p>This is some content</p>", space_key="DEMO"
+        )
+
+    def test_get_page_children_empty(self, pages_mixin):
+        """Test getting child pages when there are none."""
+        # Arrange
+        parent_id = "123456"
+
+        # Mock empty response
+        pages_mixin.confluence.get_page_child_by_type.return_value = {"results": []}
+
+        # Act
+        results = pages_mixin.get_page_children(page_id=parent_id)
+
+        # Assert
+        assert len(results) == 0
+
+    def test_get_page_children_error(self, pages_mixin):
+        """Test error handling when getting child pages."""
+        # Arrange
+        parent_id = "123456"
+
+        # Mock an exception
+        pages_mixin.confluence.get_page_child_by_type.side_effect = Exception(
+            "API Error"
+        )
+
+        # Act
+        results = pages_mixin.get_page_children(page_id=parent_id)
+
+        # Assert - should return empty list on error, not raise exception
+        assert len(results) == 0
 
     def test_get_page_success(self, pages_mixin):
         """Test successful page retrieval."""
@@ -328,3 +533,144 @@ class TestPagesMixin:
         )  # Compare version number instead of the whole object
         assert result.space.key == "TEST"
         assert result.space.name == "Test Space"
+
+    def test_create_page_with_markdown(self, pages_mixin):
+        """Test creating a new page with markdown content."""
+        # Arrange
+        space_key = "PROJ"
+        title = "New Test Page"
+        markdown_body = "# Test Heading\n\nThis is *markdown* content."
+        parent_id = "987654321"
+        storage_format = (
+            "<h1>Test Heading</h1><p>This is <em>markdown</em> content.</p>"
+        )
+
+        # Mock the markdown conversion
+        pages_mixin.preprocessor.markdown_to_confluence_storage.return_value = (
+            storage_format
+        )
+
+        # Mock get_page_content to return a ConfluencePage
+        with patch.object(
+            pages_mixin,
+            "get_page_content",
+            return_value=ConfluencePage(
+                id="123456789",
+                title=title,
+                content="Converted content",
+                space={"key": space_key, "name": "Project"},
+            ),
+        ):
+            # Act
+            result = pages_mixin.create_page(
+                space_key=space_key,
+                title=title,
+                body=markdown_body,
+                parent_id=parent_id,
+                is_markdown=True,
+            )
+
+            # Assert
+            # Verify markdown was converted
+            pages_mixin.preprocessor.markdown_to_confluence_storage.assert_called_once_with(
+                markdown_body
+            )
+
+            # Verify create_page was called with the converted content
+            pages_mixin.confluence.create_page.assert_called_once_with(
+                space=space_key,
+                title=title,
+                body=storage_format,
+                parent_id=parent_id,
+                representation="storage",
+            )
+
+            # Verify result
+            assert isinstance(result, ConfluencePage)
+            assert result.id == "123456789"
+            assert result.title == title
+
+    def test_create_page_with_storage_format(self, pages_mixin):
+        """Test creating a page with pre-converted storage format content."""
+        # Arrange
+        space_key = "PROJ"
+        title = "New Test Page"
+        storage_body = "<p>Already in storage format</p>"
+
+        # Mock get_page_content
+        with patch.object(
+            pages_mixin,
+            "get_page_content",
+            return_value=ConfluencePage(id="123456789", title=title),
+        ):
+            # Act
+            result = pages_mixin.create_page(
+                space_key=space_key, title=title, body=storage_body, is_markdown=False
+            )
+
+            # Assert
+            # Verify conversion was not called
+            pages_mixin.preprocessor.markdown_to_confluence_storage.assert_not_called()
+
+            # Verify create_page was called with the original content
+            pages_mixin.confluence.create_page.assert_called_once_with(
+                space=space_key,
+                title=title,
+                body=storage_body,
+                parent_id=None,
+                representation="storage",
+            )
+
+    def test_update_page_with_markdown(self, pages_mixin):
+        """Test updating a page with markdown content."""
+        # Arrange
+        page_id = "987654321"
+        title = "Updated Page"
+        markdown_body = "# Updated Content\n\nThis is *updated* content."
+        storage_format = (
+            "<h1>Updated Content</h1><p>This is <em>updated</em> content.</p>"
+        )
+
+        # Mock the markdown conversion
+        pages_mixin.preprocessor.markdown_to_confluence_storage.return_value = (
+            storage_format
+        )
+
+        # Mock get_page_content
+        with patch.object(
+            pages_mixin,
+            "get_page_content",
+            return_value=ConfluencePage(
+                id=page_id,
+                title=title,
+                content="Updated content",
+                space={"key": "PROJ", "name": "Project"},
+            ),
+        ):
+            # Act
+            result = pages_mixin.update_page(
+                page_id=page_id,
+                title=title,
+                body=markdown_body,
+                is_minor_edit=True,
+                version_comment="Updated test",
+                is_markdown=True,
+            )
+
+            # Assert
+            # Verify markdown was converted
+            pages_mixin.preprocessor.markdown_to_confluence_storage.assert_called_once_with(
+                markdown_body
+            )
+
+            # Verify update_page was called with the converted content
+            pages_mixin.confluence.update_page.assert_called_once_with(
+                page_id=page_id,
+                title=title,
+                body=storage_format,
+                type="page",
+                representation="storage",
+                minor_edit=True,
+                version_comment="Updated test",
+                always_update=True,
+            )

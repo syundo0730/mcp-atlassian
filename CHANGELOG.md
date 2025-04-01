@@ -2,6 +2,111 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-03-28
+
+### Added
+- Added support for retrieving Jira custom fields via MCP API (#157)
+- Added ability to download attachments from JIRA issues (#160)
+- Added development environment with devcontainer support (#159)
+- Added JiraBoards and get_all_agile_boards tool (#158)
+
+## [0.3.1] - 2025-03-27
+
+### Added
+- Added support for Jira and Confluence search filtering (#133)
+
+### Changed
+- Refactored utils module into specialized sub-modules for better organization (#154)
+- Updated documentation with new MCP setting guidance for Cursor IDE 0.47+ (#153)
+- Reduced default logging level to WARNING for better client compatibility (#155)
+
+### Fixed
+- Fixed SSLError when using SSL verification bypass option (#150)
+- Enabled legacy SSL renegotiation in Python 3.11+ environments
+
+## [0.3.0] - 2025-03-25
+
+### Added
+- Added read-only mode to disable write operations
+- Added CONTRIBUTING.md with development setup and workflow guidelines
+
+### Enhanced
+- Simplified README structure for better clarity
+- Improved field parameter handling in jira_search function
+- Enhanced documentation with focus on CLI arguments as primary configuration method
+
+### Fixed
+- Fixed fields parameter in jira_search function to properly filter returned fields
+
+## [0.2.6] - 2025-03-22
+
+### Added
+- Added support for getting Confluence pages in raw format without converting to markdown
+
+### Enhanced
+- Enhanced Jira Epic creation with a two-step approach for better field handling
+- Enhanced Epic field discovery with improved fallback mechanisms
+- Enhanced test script to support test filtering and added new tests for Jira Epic creation
+
+### Fixed
+- Fixed SSL verification bypass for self-signed certificates
+- Implemented proper SSL verification handling for Confluence and Jira servers
+
+## [0.2.5] - 2025-03-18
+
+### Added
+- Added dynamic custom field retrieval in JiraIssue with pattern matching support
+
+### Fixed
+- Fixed to allow parent field for all issue types, not just subtasks
+- Fixed user identification for Jira Data Center/Server instances with fallback mechanisms
+- Fixed pre-commit errors and updated unit tests
+
+## [0.2.4] - 2025-03-17
+
+### Added
+- Added support for Jira subtask creation with proper parent relationship handling
+- Added method to prepare parent fields for subtasks
+- Updated API documentation to include subtask creation guidance
+
+## [0.2.3] - 2025-03-16
+
+### Added
+- Added user details retrieval by account ID in ConfluenceClient to support proper user mention handling
+- Added Confluence page ancestors functionality for more reliable parent-child relationship tracking
+- Added SSE transport support for improved performance and reliability
+
+### Changed
+- Refactored markdown conversion to ConfluencePreprocessor class
+- Moved markdown_to_confluence_storage function from utils to ConfluencePreprocessor
+- Updated documentation with SSE configuration guidance
+
+## [0.2.2] - 2025-03-13
+
+### Added
+- Added Confluence get-children-page tool (#98)
+
+### Changed
+- Separated Jira and Confluence preprocessing logic for better maintainability (#99)
+- Updated README.md with Composer and Agent mode screencaptures (#95, #101)
+- Updated README.md with new demo GIF (#93)
+
+### Fixed
+- Fixed Confluence update page textcontent issue (#100)
+
+## [0.2.1] - 2025-03-13
+
+### Added
+- Added Confluence Server/Data Center support with Personal Access Token authentication
+- Added Confluence page delete tool
+
+### Fixed
+- Fixed error with confluence_delete_page function
+- Fixed handling of 'fields' attribute error in Jira fetcher
+- Removed duplicate content field in Confluence page metadata
+- Improved Confluence search functionality
+- Added Docker installation instructions
+
 ## [0.2.0] - 2025-03-12
 
 ### Changed

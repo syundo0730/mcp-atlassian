@@ -26,21 +26,13 @@ def test_from_env_success():
         assert config.api_token == "test_token"
 
 
-def test_from_env_missing_vars():
-    """Test that from_env raises ValueError when environment variables are missing."""
-    # Clear all environment variables
+def test_from_env_missing_url():
+    """Test that from_env raises ValueError when URL is missing."""
     original_env = os.environ.copy()
     try:
         os.environ.clear()
         with pytest.raises(
-            ValueError, match="Missing required Confluence environment variables"
-        ):
-            ConfluenceConfig.from_env()
-
-        # Test with partial variables
-        os.environ["CONFLUENCE_URL"] = "https://test.atlassian.net/wiki"
-        with pytest.raises(
-            ValueError, match="Missing required Confluence environment variables"
+            ValueError, match="Missing required CONFLUENCE_URL environment variable"
         ):
             ConfluenceConfig.from_env()
     finally:
@@ -49,20 +41,77 @@ def test_from_env_missing_vars():
         os.environ.update(original_env)
 
 
+def test_from_env_missing_cloud_auth():
+    """Test that from_env raises ValueError when cloud auth credentials are missing."""
+    with patch.dict(
+        os.environ,
+        {
+            "CONFLUENCE_URL": "https://test.atlassian.net",  # Cloud URL
+        },
+        clear=True,
+    ):
+        with pytest.raises(
+            ValueError,
+            match="Cloud authentication requires CONFLUENCE_USERNAME and CONFLUENCE_API_TOKEN",
+        ):
+            ConfluenceConfig.from_env()
+
+
+def test_from_env_missing_server_auth():
+    """Test that from_env raises ValueError when server auth credentials are missing."""
+    with patch.dict(
+        os.environ,
+        {
+            "CONFLUENCE_URL": "https://confluence.example.com",  # Server URL
+        },
+        clear=True,
+    ):
+        with pytest.raises(
+            ValueError,
+            match="Server/Data Center authentication requires CONFLUENCE_PERSONAL_TOKEN",
+        ):
+            ConfluenceConfig.from_env()
+
+
 def test_is_cloud():
     """Test that is_cloud property returns correct value."""
-    # Cloud instance
+    # Arrange & Act - Cloud URL
     config = ConfluenceConfig(
-        url="https://test.atlassian.net/wiki",
-        username="user",
-        api_token="token",
+        url="https://example.atlassian.net/wiki",
+        auth_type="basic",
+        username="test",
+        api_token="test",
     )
+
+    # Assert
     assert config.is_cloud is True
 
-    # Server instance
+    # Arrange & Act - Server URL
     config = ConfluenceConfig(
-        url="https://confluence.company.com",
-        username="user",
-        api_token="token",
+        url="https://confluence.example.com",
+        auth_type="token",
+        personal_token="test",
     )
+
+    # Assert
+    assert config.is_cloud is False
+
+    # Arrange & Act - Localhost URL (Data Center/Server)
+    config = ConfluenceConfig(
+        url="http://localhost:8090",
+        auth_type="token",
+        personal_token="test",
+    )
+
+    # Assert
+    assert config.is_cloud is False
+
+    # Arrange & Act - IP localhost URL (Data Center/Server)
+    config = ConfluenceConfig(
+        url="http://127.0.0.1:8090",
+        auth_type="token",
+        personal_token="test",
+    )
+
+    # Assert
     assert config.is_cloud is False

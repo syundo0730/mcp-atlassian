@@ -366,6 +366,84 @@ class JiraComment(ApiModel, TimestampMixin):
         return result
 
 
+class JiraAttachment(ApiModel):
+    """
+    Model representing a Jira issue attachment.
+
+    This model contains information about files attached to Jira issues,
+    including the filename, size, content type, and download URL.
+    """
+
+    id: str = JIRA_DEFAULT_ID
+    filename: str = EMPTY_STRING
+    size: int = 0
+    content_type: str | None = None
+    created: str = EMPTY_STRING
+    author: JiraUser | None = None
+    url: str | None = None
+    thumbnail_url: str | None = None
+
+    @classmethod
+    def from_api_response(cls, data: dict[str, Any], **kwargs: Any) -> "JiraAttachment":
+        """
+        Create a JiraAttachment from a Jira API response.
+
+        Args:
+            data: The attachment data from the Jira API
+
+        Returns:
+            A JiraAttachment instance
+        """
+        if not data:
+            return cls()
+
+        # Handle non-dictionary data by returning a default instance
+        if not isinstance(data, dict):
+            logger.debug("Received non-dictionary data, returning default instance")
+            return cls()
+
+        # Ensure ID is a string
+        attachment_id = data.get("id", JIRA_DEFAULT_ID)
+        if attachment_id is not None:
+            attachment_id = str(attachment_id)
+
+        # Extract author information
+        author = None
+        if author_data := data.get("author"):
+            author = JiraUser.from_api_response(author_data)
+
+        return cls(
+            id=attachment_id,
+            filename=str(data.get("filename", EMPTY_STRING)),
+            size=int(data.get("size", 0)),
+            content_type=data.get("mimeType"),
+            created=data.get("created", EMPTY_STRING),
+            author=author,
+            url=data.get("content"),
+            thumbnail_url=data.get("thumbnail"),
+        )
+
+    def to_simplified_dict(self) -> dict[str, Any]:
+        """Convert to simplified dictionary for API response."""
+        result = {
+            "filename": self.filename,
+            "size": self.size,
+            "created": self.created,
+            "url": self.url,
+        }
+
+        if self.content_type:
+            result["content_type"] = self.content_type
+
+        if self.author:
+            result["author"] = self.author.display_name
+
+        if self.thumbnail_url:
+            result["thumbnail_url"] = self.thumbnail_url
+
+        return result
+
+
 class JiraIssue(ApiModel, TimestampMixin):
     """
     Model representing a Jira issue.
@@ -388,9 +466,12 @@ class JiraIssue(ApiModel, TimestampMixin):
     labels: list[str] = Field(default_factory=list)
     components: list[str] = Field(default_factory=list)
     comments: list[JiraComment] = Field(default_factory=list)
+    attachments: list[JiraAttachment] = Field(default_factory=list)
     url: str | None = None
     epic_key: str | None = None
     epic_name: str | None = None
+    custom_fields: dict[str, Any] = Field(default_factory=dict)
+    requested_fields: str | list[str] | None = None
 
     @property
     def page_content(self) -> str | None:
@@ -406,6 +487,83 @@ class JiraIssue(ApiModel, TimestampMixin):
         )
         return self.description
 
+    @staticmethod
+    def _find_custom_field_by_name(
+        fields: dict[str, Any], name_patterns: list[str]
+    ) -> Any:
+        """
+        Find a custom field value by searching through field names.
+
+        Since Jira instances can have different custom field IDs for the same
+        field, this method dynamically discovers fields by their names using
+        two simple but effective strategies:
+
+        1. Search in field metadata (schema) by name - most accurate when available
+        2. Search using the fields' names() method (if available) - most flexible
+
+        This approach is advantageous over hardcoded custom field IDs because:
+        - It adapts to different Jira instances with varying field configurations
+        - It works even when custom field IDs change in Jira updates
+        - It doesn't require manual configuration or updates when field IDs change
+
+        Args:
+            fields: The fields dictionary from Jira API response
+            name_patterns: List of name patterns to match against field names
+
+        Returns:
+            The value of the first matching field, or None if not found
+        """
+        if not fields or not isinstance(fields, dict):
+            return None
+
+        # STRATEGY 1: Try to find a matching name in field metadata
+        meta_fields = fields.get("schema", {}).get("fields", {})
+        if isinstance(meta_fields, dict):
+            for field_id, field_meta in meta_fields.items():
+                if not isinstance(field_meta, dict):
+                    continue
+
+                field_name = field_meta.get("name", "").lower()
+                for pattern in name_patterns:
+                    pattern_lower = pattern.lower()
+                    # Try direct match
+                    if pattern_lower in field_name:
+                        return fields.get(field_id)
+                    # Try without spaces or hyphens
+                    normalized_pattern = pattern_lower.replace(" ", "").replace("-", "")
+                    normalized_field_name = field_name.replace(" ", "").replace("-", "")
+                    if normalized_pattern in normalized_field_name:
+                        return fields.get(field_id)
+
+        # STRATEGY 2: Try to get field names from the fields collection if available
+        if hasattr(fields, "names") and callable(getattr(fields, "names", None)):
+            try:
+                field_names = fields.names()
+                if isinstance(field_names, dict):
+                    for field_id, field_name in field_names.items():
+                        if field_id in fields and fields[field_id] is not None:
+                            field_name_lower = str(field_name).lower()
+                            for pattern in name_patterns:
+                                pattern_lower = pattern.lower()
+                                # Try direct match
+                                if pattern_lower in field_name_lower:
+                                    return fields[field_id]
+                                # Try normalized match
+                                normalized_pattern = pattern_lower.replace(
+                                    " ", ""
+                                ).replace("-", "")
+                                normalized_field_name = field_name_lower.replace(
+                                    " ", ""
+                                ).replace("-", "")
+                                if normalized_pattern in normalized_field_name:
+                                    return fields[field_id]
+            except Exception:
+                # Ignore any errors from names() method
+                logger.debug("Error accessing field names method")
+                pass
+
+        return None
+
     @classmethod
     def from_api_response(cls, data: dict[str, Any], **kwargs: Any) -> "JiraIssue":
         """
@@ -415,6 +573,7 @@ class JiraIssue(ApiModel, TimestampMixin):
             data: The issue data from the Jira API
             **kwargs: Additional context parameters, including:
                 - base_url: Base URL for constructing the issue URL
+                - requested_fields: List of fields that were requested (if any)
 
         Returns:
             A JiraIssue instance
@@ -434,6 +593,32 @@ class JiraIssue(ApiModel, TimestampMixin):
         if not isinstance(fields, dict):
             logger.debug(f"Fields is not a dict, using empty dict: {type(fields)}")
             fields = {}
+
+        # Store requested fields if provided and normalize format
+        requested_fields = kwargs.get("requested_fields")
+
+        # Handle different formats of requested_fields
+        if requested_fields is not None:
+            if isinstance(requested_fields, str) and requested_fields != "*all":
+                # Convert comma-separated string to list
+                requested_fields = [
+                    field.strip() for field in requested_fields.split(",")
+                ]
+            elif isinstance(requested_fields, list | tuple | set):
+                # Keep as-is for collections, but convert to list for consistency
+                requested_fields = list(requested_fields)
+            elif requested_fields == "*all":
+                # Keep "*all" as a string to signal all fields should be included
+                requested_fields = "*all"
+            elif requested_fields == ["*all"]:
+                # Handle the case where it's in a list
+                requested_fields = "*all"
+
+        # Extract custom fields - any field beginning with "customfield_"
+        custom_fields = {}
+        for key, value in fields.items():
+            if key.startswith("customfield_"):
+                custom_fields[key] = value
 
         # Process status
         status = None
@@ -481,6 +666,14 @@ class JiraIssue(ApiModel, TimestampMixin):
             if isinstance(comments_list, list):
                 comments = [JiraComment.from_api_response(c) for c in comments_list]
 
+        # Process attachments
+        attachments = []
+        attachments_data = fields.get("attachment", [])
+        if isinstance(attachments_data, list):
+            for attachment in attachments_data:
+                if isinstance(attachment, dict):
+                    attachments.append(JiraAttachment.from_api_response(attachment))
+
         # Construct URL if base_url is provided
         url = None
         base_url = kwargs.get("base_url")
@@ -525,9 +718,13 @@ class JiraIssue(ApiModel, TimestampMixin):
         if isinstance(labels_data, list):
             labels = [str(label) for label in labels_data if label is not None]
 
-        # Extract epic information
-        epic_key = fields.get("customfield_10014")
-        epic_name = fields.get("customfield_10011")
+        # Extract epic information dynamically
+        epic_key = cls._find_custom_field_by_name(
+            fields, ["Epic Link", "epic-link", "epiclink"]
+        )
+        epic_name = cls._find_custom_field_by_name(
+            fields, ["Epic Name", "epic-name", "epicname"]
+        )
 
         return cls(
             id=issue_id,
@@ -544,32 +741,165 @@ class JiraIssue(ApiModel, TimestampMixin):
             labels=labels,
             components=components,
             comments=comments,
+            attachments=attachments,
             url=url,
             epic_key=epic_key,
             epic_name=epic_name,
+            custom_fields=custom_fields,
+            requested_fields=requested_fields,
         )
 
     def to_simplified_dict(self) -> dict[str, Any]:
-        """Convert to a simplified dictionary representation."""
-        return {
+        """
+        Convert to a simplified dictionary representation.
+        - If fields="*all", all fields are included
+        - If specific fields are requested, only those are included
+        - If no fields specified, essential fields are included by default
+        """
+        # Always include id and key
+        result: dict[str, Any] = {
             "id": self.id,
-            "summary": self.summary,
             "key": self.key,
-            "description": self.description,
-            "created": self.format_timestamp(self.created),
-            "updated": self.format_timestamp(self.updated),
-            "status": self.status.to_simplified_dict() if self.status else None,
-            "issue_type": self.issue_type.to_simplified_dict()
-            if self.issue_type
-            else None,
-            "priority": self.priority.to_simplified_dict() if self.priority else None,
-            "assignee": self.assignee.to_simplified_dict() if self.assignee else None,
-            "reporter": self.reporter.to_simplified_dict() if self.reporter else None,
-            "labels": self.labels,
-            "components": self.components,
-            "comments": [comment.to_simplified_dict() for comment in self.comments],
-            "url": self.url,
         }
+
+        # Define essential fields (same as default in API definition)
+        essential_fields = [
+            "summary",
+            "description",
+            "status",
+            "assignee",
+            "reporter",
+            "priority",
+            "created",
+            "updated",
+            "issuetype",
+        ]
+
+        # Case 1: "*all" was explicitly requested - include everything
+        if self.requested_fields == "*all":
+            # Add all standard fields
+            result.update(
+                {
+                    "summary": self.summary,
+                    "description": self.description,
+                    "created": self.format_timestamp(self.created),
+                    "updated": self.format_timestamp(self.updated),
+                    "status": self.status.to_simplified_dict() if self.status else None,
+                    "issue_type": self.issue_type.to_simplified_dict()
+                    if self.issue_type
+                    else None,
+                    "priority": self.priority.to_simplified_dict()
+                    if self.priority
+                    else None,
+                    "assignee": self.assignee.to_simplified_dict()
+                    if self.assignee
+                    else None,
+                    "reporter": self.reporter.to_simplified_dict()
+                    if self.reporter
+                    else None,
+                    "labels": self.labels,
+                    "components": self.components,
+                    "comments": [
+                        comment.to_simplified_dict() for comment in self.comments
+                    ],
+                    "attachments": [
+                        attachment.to_simplified_dict()
+                        for attachment in self.attachments
+                    ],
+                    "url": self.url,
+                    "epic_key": self.epic_key,
+                    "epic_name": self.epic_name,
+                }
+            )
+
+            # Add all custom fields
+            for field_id, value in self.custom_fields.items():
+                result[field_id] = value
+
+        # Case 2: Specific fields were requested
+        elif self.requested_fields:
+            field_mapping = {
+                "summary": lambda: self.summary,
+                "description": lambda: self.description,
+                "created": lambda: self.format_timestamp(self.created),
+                "updated": lambda: self.format_timestamp(self.updated),
+                "status": lambda: self.status.to_simplified_dict()
+                if self.status
+                else None,
+                "issuetype": lambda: self.issue_type.to_simplified_dict()
+                if self.issue_type
+                else None,
+                "issue_type": lambda: self.issue_type.to_simplified_dict()
+                if self.issue_type
+                else None,
+                "priority": lambda: self.priority.to_simplified_dict()
+                if self.priority
+                else None,
+                "assignee": lambda: self.assignee.to_simplified_dict()
+                if self.assignee
+                else None,
+                "reporter": lambda: self.reporter.to_simplified_dict()
+                if self.reporter
+                else None,
+                "labels": lambda: self.labels,
+                "components": lambda: self.components,
+                "comment": lambda: [
+                    comment.to_simplified_dict() for comment in self.comments
+                ],
+                "comments": lambda: [
+                    comment.to_simplified_dict() for comment in self.comments
+                ],
+                "attachments": lambda: [
+                    attachment.to_simplified_dict() for attachment in self.attachments
+                ],
+                "url": lambda: self.url,
+                "epic_key": lambda: self.epic_key,
+                "epic_name": lambda: self.epic_name,
+            }
+
+            # Process each requested field
+            for field in self.requested_fields:
+                # Handle standard fields
+                if field in field_mapping:
+                    value = field_mapping[field]()
+                    if value is not None:  # Only include non-None values
+                        result[field] = value
+                # Handle custom fields
+                elif field.startswith("customfield_") and field in self.custom_fields:
+                    result[field] = self.custom_fields[field]
+
+        # Case 3: No specific fields requested - use essential fields
+        else:
+            field_mapping = {
+                "summary": lambda: self.summary,
+                "description": lambda: self.description,
+                "status": lambda: self.status.to_simplified_dict()
+                if self.status
+                else None,
+                "assignee": lambda: self.assignee.to_simplified_dict()
+                if self.assignee
+                else None,
+                "reporter": lambda: self.reporter.to_simplified_dict()
+                if self.reporter
+                else None,
+                "priority": lambda: self.priority.to_simplified_dict()
+                if self.priority
+                else None,
+                "created": lambda: self.format_timestamp(self.created),
+                "updated": lambda: self.format_timestamp(self.updated),
+                "issuetype": lambda: self.issue_type.to_simplified_dict()
+                if self.issue_type
+                else None,
+            }
+
+            # Add each essential field if it has a value
+            for field in essential_fields:
+                if field in field_mapping:
+                    value = field_mapping[field]()
+                    if value is not None:
+                        result[field] = value
+
+        return result
 
 
 class JiraProject(ApiModel):
@@ -831,12 +1161,21 @@ class JiraSearchResult(ApiModel):
             data: The search result data from the Jira API
             **kwargs: Additional context parameters, including:
                 - base_url: Base URL for constructing issue URLs
+                - requested_fields: List of fields that were requested (if "*all" or specific fields)
 
         Returns:
             A JiraSearchResult instance
         """
         if not data:
             return cls()
+
+        # Check if specific fields were requested
+        requested_fields = kwargs.get("requested_fields")
+
+        # If requested_fields is a comma-separated string, split it
+        if isinstance(requested_fields, str):
+            requested_fields = [field.strip() for field in requested_fields.split(",")]
+            kwargs["requested_fields"] = requested_fields
 
         # Convert raw issues to JiraIssue models
         issues = [
@@ -859,3 +1198,50 @@ class JiraSearchResult(ApiModel):
                 "Search found %d issues but no issue data was returned", self.total
             )
         return self
+
+
+class JiraBoard(ApiModel):
+    """
+    Model representing a Jira board.
+    """
+
+    id: str = JIRA_DEFAULT_ID
+    name: str = UNKNOWN
+    type: str = UNKNOWN
+
+    @classmethod
+    def from_api_response(cls, data: dict[str, Any], **kwargs: Any) -> "JiraBoard":
+        """
+        Create a JiraTransition instance from an API response dictionary.
+
+        Args:
+            data: The API response data
+            **kwargs: Additional options
+
+        Returns:
+            A new JiraTransition instance
+        """
+        if not data:
+            return cls()
+
+        # Handle non-dictionary data by returning a default instance
+        if not isinstance(data, dict):
+            logger.debug("Received non-dictionary data, returning default instance")
+            return cls()
+
+        transition_data: dict[str, Any] = {}
+
+        # Ensure ID is a string (API sometimes returns integers)
+        transition_id = data.get("id", JIRA_DEFAULT_ID)
+        if transition_id is not None:
+            transition_id = str(transition_id)
+        transition_data["id"] = transition_id
+
+        transition_data["name"] = str(data.get("name", UNKNOWN))
+        transition_data["type"] = str(data.get("type", UNKNOWN))
+
+        return cls(
+            id=transition_id,
+            name=str(data.get("name", UNKNOWN)),
+            type=str(data.get("type", UNKNOWN)),
+        )

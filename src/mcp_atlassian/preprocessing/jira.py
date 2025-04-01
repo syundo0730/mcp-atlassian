@@ -1,155 +1,26 @@
+"""Jira-specific text preprocessing module."""
+
 import logging
 import re
-import tempfile
-import warnings
-from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
-import requests
-from bs4 import BeautifulSoup, Tag
-from markdownify import markdownify as md
-from md2conf.converter import (
-    ConfluenceConverterOptions,
-    ConfluenceStorageFormatConverter,
-    elements_from_string,
-    elements_to_string,
-    markdown_to_html,
-)
+from .base import BasePreprocessor
 
 logger = logging.getLogger("mcp-atlassian")
 
 
-class ConfluenceClient(Protocol):
-    """Protocol for Confluence client."""
+class JiraPreprocessor(BasePreprocessor):
+    """Handles text preprocessing for Jira content."""
 
-    def get_user_details_by_accountid(self, account_id: str) -> dict[str, Any]:
-        """Get user details by account ID."""
-        ...
-
-
-class TextPreprocessor:
-    """Handles text preprocessing for Confluence and Jira content."""
-
-    def __init__(
-        self, base_url: str, confluence_client: ConfluenceClient | None = None
-    ) -> None:
+    def __init__(self, base_url: str = "", **kwargs: Any) -> None:
         """
-        Initialize the text preprocessor.
+        Initialize the Jira text preprocessor.
 
         Args:
-            base_url: Base URL for Confluence or Jira
-            confluence_client: Optional Confluence client for user lookups
+            base_url: Base URL for Jira API
+            **kwargs: Additional arguments for the base class
         """
-        self.base_url = base_url.rstrip("/")
-        self.confluence_client = confluence_client
-
-    def process_html_content(
-        self, html_content: str, space_key: str = ""
-    ) -> tuple[str, str]:
-        """
-        Process HTML content to replace user refs and page links.
-
-        Args:
-            html_content: The HTML content to process
-            space_key: Optional space key for context
-
-        Returns:
-            Tuple of (processed_html, processed_markdown)
-        """
-        try:
-            # Parse the HTML content
-            soup = BeautifulSoup(html_content, "html.parser")
-
-            # Process user mentions
-            self._process_user_mentions_in_soup(soup)
-
-            # Convert to string and markdown
-            processed_html = str(soup)
-            processed_markdown = md(processed_html)
-
-            return processed_html, processed_markdown
-
-        except Exception as e:
-            logger.error(f"Error in process_html_content: {str(e)}")
-            raise
-
-    def _process_user_mentions_in_soup(self, soup: BeautifulSoup) -> None:
-        """
-        Process user mentions in BeautifulSoup object.
-
-        Args:
-            soup: BeautifulSoup object containing HTML
-        """
-        # Find all ac:link elements that might contain user mentions
-        user_mentions = soup.find_all("ac:link")
-
-        for user_element in user_mentions:
-            user_ref = user_element.find("ri:user")
-            if user_ref and user_ref.get("ri:account-id"):
-                # Case 1: Direct user reference without link-body
-                account_id = user_ref.get("ri:account-id")
-                if isinstance(account_id, str):
-                    self._replace_user_mention(user_element, account_id)
-                    continue
-
-            # Case 2: User reference with link-body containing @
-            link_body = user_element.find("ac:link-body")
-            if link_body and "@" in link_body.get_text(strip=True):
-                user_ref = user_element.find("ri:user")
-                if user_ref and user_ref.get("ri:account-id"):
-                    account_id = user_ref.get("ri:account-id")
-                    if isinstance(account_id, str):
-                        self._replace_user_mention(user_element, account_id)
-
-    def _replace_user_mention(self, user_element: Tag, account_id: str) -> None:
-        """
-        Replace a user mention with the user's display name.
-
-        Args:
-            user_element: The HTML element containing the user mention
-            account_id: The user's account ID
-        """
-        try:
-            # Only attempt to get user details if we have a valid confluence client
-            if self.confluence_client is not None:
-                user_details = self.confluence_client.get_user_details_by_accountid(
-                    account_id
-                )
-                display_name = user_details.get("displayName", "")
-                if display_name:
-                    new_text = f"@{display_name}"
-                    user_element.replace_with(new_text)
-                    return
-            # If we don't have a confluence client or couldn't get user details,
-            # use fallback
-            self._use_fallback_user_mention(user_element, account_id)
-        except KeyError as e:
-            logger.warning(f"Missing key in user details for {account_id}: {str(e)}")
-            self._use_fallback_user_mention(user_element, account_id)
-        except (AttributeError, TypeError) as e:
-            logger.warning(f"Error parsing user data for {account_id}: {str(e)}")
-            self._use_fallback_user_mention(user_element, account_id)
-        except requests.RequestException as e:
-            logger.warning(
-                f"Network error fetching user details for {account_id}: {str(e)}"
-            )
-            self._use_fallback_user_mention(user_element, account_id)
-        except Exception as e:  # noqa: BLE001 - Intentional fallback with logging
-            logger.warning(f"Unexpected error processing user mention: {str(e)}")
-            logger.debug("Full exception details for user mention:", exc_info=True)
-            self._use_fallback_user_mention(user_element, account_id)
-
-    def _use_fallback_user_mention(self, user_element: Tag, account_id: str) -> None:
-        """
-        Replace user mention with a fallback when the API call fails.
-
-        Args:
-            user_element: The HTML element containing the user mention
-            account_id: The user's account ID
-        """
-        # Fallback: just use the account ID
-        new_text = f"@user_{account_id}"
-        user_element.replace_with(new_text)
+        super().__init__(base_url=base_url, **kwargs)
 
     def clean_jira_text(self, text: str) -> str:
         """
@@ -193,19 +64,8 @@ class TextPreprocessor:
                 # Note: This is a placeholder - actual user fetching should be injected
                 display_name = f"User:{account_id}"
                 text = text.replace(f"[~accountid:{account_id}]", display_name)
-            except (TypeError, ValueError) as e:
-                logger.error(f"Error formatting mention for {account_id}: {str(e)}")
-            except re.error as e:
-                logger.error(
-                    f"Regex error processing mention for {account_id}: {str(e)}"
-                )
-            except Exception as e:  # noqa: BLE001 - Intentional fallback with logging
-                logger.error(
-                    f"Unexpected error processing mention for {account_id}: {str(e)}"
-                )
-                logger.debug(
-                    "Full exception details for mention processing:", exc_info=True
-                )
+            except Exception as e:
+                logger.error(f"Error processing mention for {account_id}: {str(e)}")
         return text
 
     def _process_smart_links(self, text: str) -> str:
@@ -239,36 +99,6 @@ class TextPreprocessor:
                 clean_url = link_url.split("?")[0]
                 text = text.replace(full_match, f"[{link_text}]({clean_url})")
 
-        return text
-
-    def _convert_html_to_markdown(self, text: str) -> str:
-        """Convert HTML content to markdown if needed."""
-        if re.search(r"<[^>]+>", text):
-            try:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=UserWarning)
-                    soup = BeautifulSoup(f"<div>{text}</div>", "html.parser")
-                    html = str(soup.div.decode_contents()) if soup.div else text
-                    text = md(html)
-            except (AttributeError, TypeError) as e:
-                # Handle parsing errors in BeautifulSoup
-                logger.warning(f"HTML parsing error during conversion to markdown: {e}")
-            except ImportError as e:
-                # Handle missing dependencies
-                logger.warning(
-                    f"Missing dependency for HTML to markdown conversion: {e}"
-                )
-            except (ValueError, NameError) as e:
-                # Handle value or name errors
-                logger.warning(
-                    f"Error in values during HTML to markdown conversion: {e}"
-                )
-            except Exception as e:  # noqa: BLE001 - Intentional fallback with logging
-                # Handle other unexpected errors
-                logger.warning(f"Unexpected error converting HTML to markdown: {e}")
-                logger.debug(
-                    "Full exception details for HTML conversion:", exc_info=True
-                )
         return text
 
     def jira_to_markdown(self, input_text: str) -> str:
@@ -485,9 +315,11 @@ class TextPreprocessor:
         # Multi-level bulleted list
         output = re.sub(
             r"^(\s*)- (.*)$",
-            lambda match: "* " + match.group(2)
-            if not match.group(1)
-            else "  " * (len(match.group(1)) // 2) + "* " + match.group(2),
+            lambda match: (
+                "* " + match.group(2)
+                if not match.group(1)
+                else "  " * (len(match.group(1)) // 2) + "* " + match.group(2)
+            ),
             output,
             flags=re.MULTILINE,
         )
@@ -569,64 +401,3 @@ class TextPreprocessor:
         prefix = "1." if last_char == "#" else "-"
 
         return f"{indent}{prefix} {content}"
-
-
-def markdown_to_confluence_storage(markdown_content: str) -> str:
-    """
-    Convert Markdown content to Confluence storage format (XHTML)
-
-    Args:
-        markdown_content: Markdown text to convert
-
-    Returns:
-        Confluence storage format (XHTML) string
-    """
-    try:
-        # First convert markdown to HTML
-        html_content = markdown_to_html(markdown_content)
-
-        # Create a temporary directory for any potential attachments
-        temp_dir = tempfile.mkdtemp()
-
-        try:
-            # Parse the HTML into an element tree
-            root = elements_from_string(html_content)
-
-            # Create converter options
-            options = ConfluenceConverterOptions(
-                ignore_invalid_url=True, heading_anchors=True, render_mermaid=False
-            )
-
-            # Create a converter
-            converter = ConfluenceStorageFormatConverter(
-                options=options,
-                path=Path(temp_dir) / "temp.md",
-                root_dir=Path(temp_dir),
-                page_metadata={},
-            )
-
-            # Transform the HTML to Confluence storage format
-            converter.visit(root)
-
-            # Convert the element tree back to a string
-            storage_format = elements_to_string(root)
-
-            return str(storage_format)
-        finally:
-            # Clean up the temporary directory
-            import shutil
-
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-    except Exception as e:
-        logger.error(f"Error converting markdown to Confluence storage format: {e}")
-        logger.exception(e)
-
-        # Fall back to a simpler method if the conversion fails
-        html_content = markdown_to_html(markdown_content)
-
-        # Use a different approach that doesn't rely on the HTML macro
-        # This creates a proper Confluence storage format document
-        storage_format = f"""<p>{html_content}</p>"""
-
-        return str(storage_format)

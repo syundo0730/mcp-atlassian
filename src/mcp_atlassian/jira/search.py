@@ -4,6 +4,7 @@ import logging
 
 from ..models.jira import JiraIssue, JiraSearchResult
 from .client import JiraClient
+from .utils import parse_date_ymd
 
 logger = logging.getLogger("mcp-jira")
 
@@ -14,20 +15,26 @@ class SearchMixin(JiraClient):
     def search_issues(
         self,
         jql: str,
-        fields: str = "*all",
+        fields: str
+        | list[str]
+        | tuple[str, ...]
+        | set[str]
+        | None = "summary,description,status,assignee,reporter,labels,priority,created,updated,issuetype",
         start: int = 0,
         limit: int = 50,
         expand: str | None = None,
+        projects_filter: str | None = None,
     ) -> list[JiraIssue]:
         """
         Search for issues using JQL (Jira Query Language).
 
         Args:
             jql: JQL query string
-            fields: Fields to return (comma-separated string or "*all")
+            fields: Fields to return (comma-separated string, list, tuple, set, or "*all")
             start: Starting index
             limit: Maximum issues to return
             expand: Optional items to expand (comma-separated)
+            projects_filter: Optional comma-separated list of project keys to filter by, overrides config
 
         Returns:
             List of JiraIssue models representing the search results
@@ -36,13 +43,44 @@ class SearchMixin(JiraClient):
             Exception: If there is an error searching for issues
         """
         try:
+            # Use projects_filter parameter if provided, otherwise fall back to config
+            filter_to_use = projects_filter or self.config.projects_filter
+
+            # Apply projects filter if present
+            if filter_to_use:
+                # Split projects filter by commas and handle possible whitespace
+                projects = [p.strip() for p in filter_to_use.split(",")]
+
+                # Build the project filter query part
+                if len(projects) == 1:
+                    project_query = f"project = {projects[0]}"
+                else:
+                    quoted_projects = [f'"{p}"' for p in projects]
+                    projects_list = ", ".join(quoted_projects)
+                    project_query = f"project IN ({projects_list})"
+
+                # Add the project filter to existing query
+                if jql and project_query:
+                    if "project = " not in jql and "project IN" not in jql:
+                        # Only add if not already filtering by project
+                        jql = f"({jql}) AND {project_query}"
+                else:
+                    jql = project_query
+
+                logger.info(f"Applied projects filter to query: {jql}")
+
+            # Convert fields to proper format if it's a list/tuple/set
+            fields_param = fields
+            if fields and isinstance(fields, list | tuple | set):
+                fields_param = ",".join(fields)
+
             response = self.jira.jql(
-                jql, fields=fields, start=start, limit=limit, expand=expand
+                jql, fields=fields_param, start=start, limit=limit, expand=expand
             )
 
             # Convert the response to a search result model
             search_result = JiraSearchResult.from_api_response(
-                response, base_url=self.config.url
+                response, base_url=self.config.url, requested_fields=fields
             )
 
             # Return the list of issues
@@ -129,28 +167,11 @@ class SearchMixin(JiraClient):
         """
         Parse a date string from ISO format to a more readable format.
 
-        This method is included in the SearchMixin for independence from other mixins,
-        but will use the implementation from IssuesMixin if available.
-
         Args:
             date_str: Date string in ISO format
 
         Returns:
             Formatted date string
         """
-        # If we're also using IssuesMixin, use its implementation
-        if (
-            hasattr(self, "_parse_date")
-            and self.__class__._parse_date is not SearchMixin._parse_date
-        ):
-            # This avoids infinite recursion by checking that the method is different
-            return super()._parse_date(date_str)
-
-        # Fallback implementation
-        try:
-            from datetime import datetime
-
-            date_obj = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            return date_obj.strftime("%Y-%m-%d")
-        except (ValueError, TypeError):
-            return date_str
+        # Use the common utility function for consistent formatting
+        return parse_date_ymd(date_str)

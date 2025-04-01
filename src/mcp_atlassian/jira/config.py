@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from typing import Literal
 
+from ..utils import is_atlassian_cloud_url
+
 
 @dataclass
 class JiraConfig:
@@ -19,6 +21,7 @@ class JiraConfig:
     api_token: str | None = None  # API token (Cloud)
     personal_token: str | None = None  # Personal access token (Server/DC)
     ssl_verify: bool = True  # Whether to verify SSL certificates
+    projects_filter: str | None = None  # List of project keys to filter searches
 
     @property
     def is_cloud(self) -> bool:
@@ -26,8 +29,9 @@ class JiraConfig:
 
         Returns:
             True if this is a cloud instance (atlassian.net), False otherwise.
+            Localhost URLs are always considered non-cloud (Server/Data Center).
         """
-        return "atlassian.net" in self.url
+        return is_atlassian_cloud_url(self.url)
 
     @property
     def verify_ssl(self) -> bool:
@@ -58,7 +62,8 @@ class JiraConfig:
         api_token = os.getenv("JIRA_API_TOKEN")
         personal_token = os.getenv("JIRA_PERSONAL_TOKEN")
 
-        is_cloud = "atlassian.net" in url
+        # Use the shared utility function directly
+        is_cloud = is_atlassian_cloud_url(url)
 
         if is_cloud:
             if username and api_token:
@@ -84,6 +89,9 @@ class JiraConfig:
         ssl_verify_env = os.getenv("JIRA_SSL_VERIFY", "true").lower()
         ssl_verify = ssl_verify_env not in ("false", "0", "no")
 
+        # Get the projects filter if provided
+        projects_filter = os.getenv("JIRA_PROJECTS_FILTER")
+
         return cls(
             url=url,
             auth_type=auth_type,
@@ -91,4 +99,5 @@ class JiraConfig:
             api_token=api_token,
             personal_token=personal_token,
             ssl_verify=ssl_verify,
+            projects_filter=projects_filter,
         )

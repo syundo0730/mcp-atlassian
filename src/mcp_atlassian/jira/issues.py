@@ -1,11 +1,11 @@
 """Module for Jira issue operations."""
 
 import logging
-from datetime import datetime
 from typing import Any
 
 from ..models.jira import JiraIssue
 from .users import UsersMixin
+from .utils import parse_date_human_readable
 
 logger = logging.getLogger("mcp-jira")
 
@@ -18,6 +18,13 @@ class IssuesMixin(UsersMixin):
         issue_key: str,
         expand: str | None = None,
         comment_limit: int | str | None = 10,
+        fields: str
+        | list[str]
+        | tuple[str, ...]
+        | set[str]
+        | None = "summary,description,status,assignee,reporter,labels,priority,created,updated,issuetype",
+        properties: str | list[str] | None = None,
+        update_history: bool = True,
     ) -> JiraIssue:
         """
         Get a Jira issue by key.
@@ -26,6 +33,9 @@ class IssuesMixin(UsersMixin):
             issue_key: The issue key (e.g., PROJECT-123)
             expand: Fields to expand in the response
             comment_limit: Maximum number of comments to include, or "all"
+            fields: Fields to return (comma-separated string, list, tuple, set, or "*all")
+            properties: Issue properties to return (comma-separated string or list)
+            update_history: Whether to update the issue view history
 
         Returns:
             JiraIssue model with issue data and metadata
@@ -34,18 +44,99 @@ class IssuesMixin(UsersMixin):
             Exception: If there is an error retrieving the issue
         """
         try:
+            # Ensure necessary fields are included based on special parameters
+            if (
+                isinstance(fields, str)
+                and fields
+                == "summary,description,status,assignee,reporter,labels,priority,created,updated,issuetype"
+            ):
+                # Default fields are being used - preserve the order
+                default_fields_list = fields.split(",")
+                additional_fields = []
+
+                # Add 'comment' field if comment_limit is specified and non-zero
+                if (
+                    comment_limit
+                    and comment_limit != 0
+                    and "comment" not in default_fields_list
+                ):
+                    additional_fields.append("comment")
+
+                # Add appropriate fields based on expand parameter
+                if expand:
+                    expand_params = expand.split(",")
+                    if (
+                        "changelog" in expand_params
+                        and "changelog" not in default_fields_list
+                        and "changelog" not in additional_fields
+                    ):
+                        additional_fields.append("changelog")
+                    if (
+                        "renderedFields" in expand_params
+                        and "rendered" not in default_fields_list
+                        and "rendered" not in additional_fields
+                    ):
+                        additional_fields.append("rendered")
+
+                # Add appropriate fields based on properties parameter
+                if (
+                    properties
+                    and "properties" not in default_fields_list
+                    and "properties" not in additional_fields
+                ):
+                    additional_fields.append("properties")
+
+                # Combine default fields with additional fields, preserving order
+                if additional_fields:
+                    fields = fields + "," + ",".join(additional_fields)
+            # Handle non-default fields string
+            elif comment_limit and comment_limit != 0:
+                if isinstance(fields, str):
+                    if fields != "*all" and "comment" not in fields:
+                        # Add comment to string fields
+                        fields += ",comment"
+                elif isinstance(fields, list) and "comment" not in fields:
+                    # Add comment to list fields
+                    fields = fields + ["comment"]
+                elif isinstance(fields, tuple) and "comment" not in fields:
+                    # Convert tuple to list, add comment, then convert back to tuple
+                    fields_list = list(fields)
+                    fields_list.append("comment")
+                    fields = tuple(fields_list)
+                elif isinstance(fields, set) and "comment" not in fields:
+                    # Add comment to set fields
+                    fields_copy = fields.copy()
+                    fields_copy.add("comment")
+                    fields = fields_copy
+
             # Build expand parameter if provided
             expand_param = None
             if expand:
                 expand_param = expand
 
-            # Get the issue data
-            issue = self.jira.issue(issue_key, expand=expand_param)
+            # Convert fields to proper format if it's a list/tuple/set
+            fields_param = fields
+            if fields and isinstance(fields, list | tuple | set):
+                fields_param = ",".join(fields)
+
+            # Convert properties to proper format if it's a list
+            properties_param = properties
+            if properties and isinstance(properties, list | tuple | set):
+                properties_param = ",".join(properties)
+
+            # Get the issue data with all parameters
+            issue = self.jira.get_issue(
+                issue_key,
+                expand=expand_param,
+                fields=fields_param,
+                properties=properties_param,
+                update_history=update_history,
+            )
             if not issue:
                 raise ValueError(f"Issue {issue_key} not found")
 
             # Extract fields data, safely handling None
-            fields = issue.get("fields", {}) or {}
+            fields_data = issue.get("fields", {}) or {}
 
             # Get comments if needed
             comment_limit_int = self._normalize_comment_limit(comment_limit)
@@ -57,35 +148,49 @@ class IssuesMixin(UsersMixin):
 
             # Add comments to the issue data for processing by the model
             if comments:
-                if "comment" not in fields:
-                    fields["comment"] = {}
-                fields["comment"]["comments"] = comments
+                if "comment" not in fields_data:
+                    fields_data["comment"] = {}
+                fields_data["comment"]["comments"] = comments
 
             # Extract epic information
-            epic_info = self._extract_epic_information(issue)
+            try:
+                epic_info = self._extract_epic_information(issue)
+            except Exception as e:
+                logger.warning(f"Error extracting epic information: {str(e)}")
+                epic_info = {"epic_key": None, "epic_name": None}
 
             # If this is linked to an epic, add the epic information to the fields
             if epic_info.get("epic_key"):
-                # Get field IDs for epic fields
-                field_ids = self.get_jira_field_ids()
+                try:
+                    # Get field IDs for epic fields
+                    field_ids = self.get_jira_field_ids()
 
-                # Add epic link field if it doesn't exist
-                if "epic_link" in field_ids and field_ids["epic_link"] not in fields:
-                    fields[field_ids["epic_link"]] = epic_info["epic_key"]
+                    # Add epic link field if it doesn't exist
+                    if (
+                        "epic_link" in field_ids
+                        and field_ids["epic_link"] not in fields_data
+                    ):
+                        fields_data[field_ids["epic_link"]] = epic_info["epic_key"]
 
-                # Add epic name field if it doesn't exist
-                if (
-                    epic_info.get("epic_name")
-                    and "epic_name" in field_ids
-                    and field_ids["epic_name"] not in fields
-                ):
-                    fields[field_ids["epic_name"]] = epic_info["epic_name"]
+                    # Add epic name field if it doesn't exist
+                    if (
+                        epic_info.get("epic_name")
+                        and "epic_name" in field_ids
+                        and field_ids["epic_name"] not in fields_data
+                    ):
+                        fields_data[field_ids["epic_name"]] = epic_info["epic_name"]
+                except Exception as e:
+                    logger.warning(f"Error setting epic fields: {str(e)}")
 
             # Update the issue data with the fields
-            issue["fields"] = fields
+            issue["fields"] = fields_data
 
-            # Create and return the JiraIssue model
-            return JiraIssue.from_api_response(issue, base_url=self.config.url)
+            # Create and return the JiraIssue model, passing requested_fields
+            return JiraIssue.from_api_response(
+                issue,
+                base_url=self.config.url if hasattr(self, "config") else None,
+                requested_fields=fields,
+            )
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Error retrieving issue {issue_key}: {error_msg}")
@@ -169,7 +274,11 @@ class IssuesMixin(UsersMixin):
             issue_type = fields.get("issuetype", {}).get("name", "").lower()
 
             # Get field IDs for epic fields
-            field_ids = self.get_jira_field_ids()
+            try:
+                field_ids = self.get_jira_field_ids()
+            except Exception as e:
+                logger.warning(f"Error getting Jira fields: {str(e)}")
+                field_ids = {}
 
             # Check if this is an epic
             if issue_type == "epic":
@@ -189,7 +298,13 @@ class IssuesMixin(UsersMixin):
 
                     # Try to get epic details
                     try:
-                        epic = self.jira.issue(epic_key)
+                        epic = self.jira.get_issue(
+                            epic_key,
+                            expand=None,
+                            fields=None,
+                            properties=None,
+                            update_history=True,
+                        )
                         epic_fields = epic.get("fields", {}) or {}
 
                         # Get epic name using the discovered field ID
@@ -218,13 +333,8 @@ class IssuesMixin(UsersMixin):
         Returns:
             Formatted date string
         """
-        try:
-            # Parse ISO 8601 format
-            date_obj = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            # Format: January 1, 2023
-            return date_obj.strftime("%B %d, %Y")
-        except (ValueError, TypeError):
-            return date_str
+        # Use the common utility function for consistent formatting
+        return parse_date_human_readable(date_str)
 
     def _format_issue_content(
         self,
@@ -415,9 +525,20 @@ class IssuesMixin(UsersMixin):
                 except ValueError as e:
                     logger.warning(f"Could not assign issue: {str(e)}")
 
+            # Make a copy of kwargs to preserve original values for two-step Epic creation
+            kwargs_copy = kwargs.copy()
+
             # Prepare epic fields if this is an epic
+            # This step now stores epic-specific fields in kwargs for post-creation update
             if issue_type.lower() == "epic":
                 self._prepare_epic_fields(fields, summary, kwargs)
+
+            # Prepare parent field if this is a subtask
+            if issue_type.lower() == "subtask" or issue_type.lower() == "sub-task":
+                self._prepare_parent_fields(fields, kwargs)
+            # Allow parent field for all issue types when explicitly provided
+            elif "parent" in kwargs:
+                self._prepare_parent_fields(fields, kwargs)
 
             # Add custom fields
             self._add_custom_fields(fields, kwargs)
@@ -431,8 +552,29 @@ class IssuesMixin(UsersMixin):
                 error_msg = "No issue key in response"
                 raise ValueError(error_msg)
 
+            # For Epics, perform the second step: update Epic-specific fields
+            if issue_type.lower() == "epic":
+                # Check if we have any stored Epic fields to update
+                has_epic_fields = any(k.startswith("__epic_") for k in kwargs)
+                if has_epic_fields:
+                    logger.info(
+                        f"Performing post-creation update for Epic {issue_key} with Epic-specific fields"
+                    )
+                    try:
+                        # Delegate to EpicsMixin.update_epic_fields
+                        from mcp_atlassian.jira.epics import EpicsMixin
+
+                        return EpicsMixin.update_epic_fields(self, issue_key, kwargs)
+                    except Exception as update_error:
+                        logger.error(
+                            f"Error during post-creation update of Epic {issue_key}: {str(update_error)}"
+                        )
+                        logger.info(
+                            "Continuing with the original Epic that was successfully created"
+                        )
+
             # Get the full issue data and convert to JiraIssue model
-            issue_data = self.jira.issue(issue_key)
+            issue_data = self.jira.get_issue(issue_key)
             return JiraIssue.from_api_response(issue_data)
 
         except Exception as e:
@@ -445,22 +587,48 @@ class IssuesMixin(UsersMixin):
         """
         Prepare fields for epic creation.
 
+        This method delegates to the prepare_epic_fields method in EpicsMixin.
+
         Args:
             fields: The fields dictionary to update
             summary: The epic summary
             kwargs: Additional fields from the user
         """
-        # Get all field IDs
-        field_ids = self.get_jira_field_ids()
+        # Delegate to EpicsMixin.prepare_epic_fields
+        # Since JiraFetcher inherits from both IssuesMixin and EpicsMixin,
+        # this will correctly use the prepare_epic_fields method from EpicsMixin
+        # which implements the two-step Epic creation approach
+        from mcp_atlassian.jira.epics import EpicsMixin
 
-        # Epic Name field
-        epic_name_field = field_ids.get("Epic Name")
-        if epic_name_field and "epic_name" not in kwargs:
-            fields[epic_name_field] = summary
+        EpicsMixin.prepare_epic_fields(self, fields, summary, kwargs)
 
-        # Override with user-provided epic name if available
-        if "epic_name" in kwargs and epic_name_field:
-            fields[epic_name_field] = kwargs["epic_name"]
+    def _prepare_parent_fields(
+        self, fields: dict[str, Any], kwargs: dict[str, Any]
+    ) -> None:
+        """
+        Prepare fields for parent relationship.
+
+        Args:
+            fields: The fields dictionary to update
+            kwargs: Additional fields from the user
+
+        Raises:
+            ValueError: If parent issue key is not specified for a subtask
+        """
+        if "parent" in kwargs:
+            parent_key = kwargs.get("parent")
+            if parent_key:
+                fields["parent"] = {"key": parent_key}
+            # Remove parent from kwargs to avoid double processing
+            kwargs.pop("parent", None)
+        elif "issuetype" in fields and fields["issuetype"]["name"].lower() in (
+            "subtask",
+            "sub-task",
+        ):
+            # Only raise error if issue type is subtask and parent is missing
+            raise ValueError(
+                "Issue type is a sub-task but parent issue key or id not specified. Please provide a 'parent' parameter with the parent issue key."
+            )
 
     def _add_assignee_to_fields(self, fields: dict[str, Any], assignee: str) -> None:
         """
@@ -491,7 +659,7 @@ class IssuesMixin(UsersMixin):
 
         # Process each kwarg
         for key, value in kwargs.items():
-            if key in ("epic_name", "epic_link"):
+            if key in ("epic_name", "epic_link", "parent"):
                 continue  # Handled separately
 
             # Check if this is a known field
@@ -584,7 +752,7 @@ class IssuesMixin(UsersMixin):
                 )
 
             # Get the updated issue data and convert to JiraIssue model
-            issue_data = self.jira.issue(issue_key)
+            issue_data = self.jira.get_issue(issue_key)
             return JiraIssue.from_api_response(issue_data)
 
         except Exception as e:
@@ -617,7 +785,7 @@ class IssuesMixin(UsersMixin):
 
         # If no status change is requested, return the issue
         if not status:
-            issue_data = self.jira.issue(issue_key)
+            issue_data = self.jira.get_issue(issue_key)
             return JiraIssue.from_api_response(issue_data)
 
         # Get available transitions
@@ -706,13 +874,15 @@ class IssuesMixin(UsersMixin):
         logger.info(f"Performing transition with ID {transition_id}")
         self.jira.set_issue_status_by_transition_id(
             issue_key=issue_key,
-            transition_id=int(transition_id)
-            if isinstance(transition_id, str) and transition_id.isdigit()
-            else transition_id,
+            transition_id=(
+                int(transition_id)
+                if isinstance(transition_id, str) and transition_id.isdigit()
+                else transition_id
+            ),
         )
 
         # Get the updated issue data
-        issue_data = self.jira.issue(issue_key)
+        issue_data = self.jira.get_issue(issue_key)
         return JiraIssue.from_api_response(issue_data)
 
     def delete_issue(self, issue_key: str) -> bool:
@@ -766,6 +936,11 @@ class IssuesMixin(UsersMixin):
 
         # Fetch field IDs from server
         try:
+            # Check if get_all_fields method exists before calling it
+            if not hasattr(self.jira, "get_all_fields"):
+                logger.warning("Jira object does not have 'get_all_fields' method")
+                return {}
+
             fields = self.jira.get_all_fields()
             field_ids = {}
 
@@ -850,7 +1025,12 @@ class IssuesMixin(UsersMixin):
         try:
             # Try to find an epic using JQL search
             jql = "issuetype = Epic ORDER BY created DESC"
-            results = self.jira.jql(jql, limit=1)
+            try:
+                results = self.jira.jql(jql, limit=1)
+            except AttributeError:
+                # If jql method doesn't exist, try another approach or skip
+                logger.debug("JQL method not available on this Jira instance")
+                return
 
             if not results or not results.get("issues"):
                 return
@@ -864,7 +1044,11 @@ class IssuesMixin(UsersMixin):
 
             # Try to find issues linked to this epic using JQL
             linked_jql = f'issue in linkedIssues("{epic_key}") ORDER BY created DESC'
-            results = self.jira.jql(linked_jql, limit=10)
+            try:
+                results = self.jira.jql(linked_jql, limit=10)
+            except Exception as e:
+                logger.debug(f"Error querying linked issues: {str(e)}")
+                return
 
             if not results or not results.get("issues"):
                 return
@@ -874,6 +1058,8 @@ class IssuesMixin(UsersMixin):
 
             for issue in issues:
                 fields = issue.get("fields", {})
+                if not fields or not isinstance(fields, dict):
+                    continue
 
                 # Check each field for a potential epic link
                 for field_id, value in fields.items():
@@ -889,6 +1075,7 @@ class IssuesMixin(UsersMixin):
 
         except Exception as e:
             logger.debug(f"Error discovering epic fields: {str(e)}")
+            # Continue with existing field_ids
 
     def get_available_transitions(self, issue_key: str) -> list[dict]:
         """

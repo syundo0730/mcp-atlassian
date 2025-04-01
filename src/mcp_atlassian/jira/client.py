@@ -4,6 +4,9 @@ import logging
 
 from atlassian import Jira
 
+from mcp_atlassian.preprocessing import JiraPreprocessor
+from mcp_atlassian.utils.ssl import configure_ssl_verification
+
 from .config import JiraConfig
 
 # Configure logging
@@ -22,8 +25,6 @@ class JiraClient:
         Raises:
             ValueError: If configuration is invalid or required credentials are missing
         """
-        from mcp_atlassian.preprocessing import TextPreprocessor
-
         # Load configuration from environment variables if not provided
         self.config = config or JiraConfig.from_env()
 
@@ -44,8 +45,16 @@ class JiraClient:
                 verify_ssl=self.config.ssl_verify,
             )
 
+        # Configure SSL verification using the shared utility
+        configure_ssl_verification(
+            service_name="Jira",
+            url=self.config.url,
+            session=self.jira._session,
+            ssl_verify=self.config.ssl_verify,
+        )
+
         # Initialize the text preprocessor for text processing capabilities
-        self.preprocessor = TextPreprocessor(self.config.url)
+        self.preprocessor = JiraPreprocessor(base_url=self.config.url)
 
         # Cache for frequently used data
         self._field_ids: dict[str, str] | None = None

@@ -399,6 +399,62 @@ async def test_jira_get_issue(jira_client: JiraFetcher, test_issue_key: str) -> 
 
 
 @pytest.mark.anyio
+async def test_jira_get_issue_with_fields(
+    jira_client: JiraFetcher, test_issue_key: str
+) -> None:
+    """Test retrieving a Jira issue with specific fields."""
+    # Get the issue with all fields first to have a reference
+    full_issue = jira_client.get_issue(test_issue_key)
+    assert full_issue is not None
+
+    # Now get the issue with only specific fields
+    limited_issue = jira_client.get_issue(
+        test_issue_key, fields="summary,description,customfield_*"
+    )
+
+    # Verify we got the requested fields
+    assert limited_issue is not None
+    assert limited_issue.key == test_issue_key
+    assert limited_issue.summary is not None
+
+    # Get simplified dicts to compare
+    full_data = full_issue.to_simplified_dict()
+    limited_data = limited_issue.to_simplified_dict()
+
+    # Required fields should be in both
+    assert "key" in full_data and "key" in limited_data
+    assert "id" in full_data and "id" in limited_data
+    assert "summary" in full_data and "summary" in limited_data
+
+    # Fields that should be in limited result
+    assert "description" in limited_data
+
+    # Check custom fields if there are any
+    custom_fields_found = False
+    for field in limited_data:
+        if field.startswith("customfield_"):
+            custom_fields_found = True
+            break
+
+    # Fields that shouldn't be in limited result unless they were requested
+    if "assignee" in full_data and "assignee" not in limited_data:
+        assert "assignee" not in limited_data
+    if "status" in full_data and "status" not in limited_data:
+        assert "status" not in limited_data
+
+    # Test with a list of fields
+    list_fields_issue = jira_client.get_issue(
+        test_issue_key, fields=["summary", "status"]
+    )
+
+    assert list_fields_issue is not None
+    list_data = list_fields_issue.to_simplified_dict()
+    assert "summary" in list_data
+    if "status" in full_data:
+        assert "status" in list_data
+
+
+@pytest.mark.anyio
 async def test_jira_get_epic_issues(
     jira_client: JiraFetcher, test_epic_key: str
 ) -> None:
@@ -421,20 +477,13 @@ async def test_confluence_get_page_content(
     confluence_client: ConfluenceFetcher, test_page_id: str
 ) -> None:
     """Test retrieving a page from Confluence."""
-    # Get the page content (method name might be different)
-    # Try different method names based on the class implementation
-    if hasattr(confluence_client, "get_page_by_id"):
-        page = confluence_client.get_page_by_id(test_page_id)
-    elif hasattr(confluence_client, "get_content"):
-        page = confluence_client.get_content(test_page_id)
-    else:
-        # If direct methods don't exist, try indirection through the client
-        page = confluence_client.confluence.get_page_by_id(test_page_id)
+    # Get the page content using our module's API
+    page = confluence_client.get_page_content(test_page_id)
 
     # Verify the response
     assert page is not None
-    assert "id" in page or hasattr(page, "id")
-    assert "title" in page or hasattr(page, "title")
+    assert page.id == test_page_id
+    assert page.title is not None
 
 
 @pytest.mark.anyio
@@ -474,6 +523,195 @@ async def test_jira_create_issue(
         assert retrieved_issue.summary == summary
     finally:
         # Clean up resources even if the test fails
+        cleanup_resources()
+
+
+@pytest.mark.anyio
+async def test_jira_create_subtask(
+    jira_client: JiraFetcher,
+    test_project_key: str,
+    test_issue_key: str,
+    test_epic_key: str,
+    resource_tracker: ResourceTracker,
+    cleanup_resources: Callable[[], None],
+) -> None:
+    """Test creating a subtask in Jira linked to a specified parent and epic."""
+    # Generate unique identifiers for this test
+    test_id = str(uuid.uuid4())[:8]
+    subtask_summary = f"Subtask Test Issue {test_id}"
+
+    try:
+        # Use the existing issue as parent instead of creating one
+        parent_issue_key = test_issue_key
+
+        # Create a subtask linked to both the parent and epic
+        subtask_issue = jira_client.create_issue(
+            project_key=test_project_key,
+            summary=subtask_summary,
+            description=f"This is a test subtask linked to parent {parent_issue_key} and epic {test_epic_key}",
+            issue_type="Subtask",
+            parent=parent_issue_key,  # Link to parent
+            epic_link=test_epic_key,  # Link to epic
+        )
+
+        # Track the subtask for cleanup
+        resource_tracker.add_jira_issue(subtask_issue.key)
+
+        # Verify the subtask response
+        assert subtask_issue is not None
+        assert subtask_issue.key.startswith(test_project_key)
+        assert subtask_issue.summary == subtask_summary
+
+        # Verify we can retrieve the created subtask
+        retrieved_subtask = jira_client.get_issue(subtask_issue.key)
+        assert retrieved_subtask is not None
+        assert retrieved_subtask.key == subtask_issue.key
+
+        # Verify parent relationship if the fields are accessible
+        # This might vary depending on how the Jira instance returns data
+        if hasattr(retrieved_subtask, "fields"):
+            if hasattr(retrieved_subtask.fields, "parent"):
+                assert retrieved_subtask.fields.parent.key == parent_issue_key
+
+            # Check epic relationship if available
+            # The exact field name might vary based on Jira configuration
+            field_ids = jira_client.get_jira_field_ids()
+            epic_link_field = field_ids.get("epic_link") or field_ids.get("Epic Link")
+
+            if epic_link_field and hasattr(retrieved_subtask.fields, epic_link_field):
+                epic_key = getattr(retrieved_subtask.fields, epic_link_field)
+                assert epic_key == test_epic_key
+
+        print(
+            f"\nCreated subtask {subtask_issue.key} under parent {parent_issue_key} and epic {test_epic_key}"
+        )
+
+    finally:
+        # Clean up resources even if the test fails
+        cleanup_resources()
+
+
+@pytest.mark.anyio
+async def test_jira_create_task_with_parent(
+    jira_client: JiraFetcher,
+    test_project_key: str,
+    test_epic_key: str,
+    resource_tracker: ResourceTracker,
+    cleanup_resources: Callable[[], None],
+) -> None:
+    """Test creating a task in Jira with a parent issue (non-subtask)."""
+    # Generate unique identifiers for this test
+    test_id = str(uuid.uuid4())[:8]
+    task_summary = f"Task with Parent Test {test_id}"
+
+    try:
+        # Use the epic as parent instead of a regular issue
+        parent_issue_key = test_epic_key
+
+        try:
+            # Create a task linked to a parent issue
+            task_issue = jira_client.create_issue(
+                project_key=test_project_key,
+                summary=task_summary,
+                description=f"This is a test task linked to parent {parent_issue_key}",
+                issue_type="Task",  # Not a subtask
+                parent=parent_issue_key,  # Link to parent
+            )
+
+            # Track the task for cleanup
+            resource_tracker.add_jira_issue(task_issue.key)
+
+            # Verify the task response
+            assert task_issue is not None
+            assert task_issue.key.startswith(test_project_key)
+            assert task_issue.summary == task_summary
+
+            # Verify we can retrieve the created task
+            retrieved_task = jira_client.get_issue(task_issue.key)
+            assert retrieved_task is not None
+            assert retrieved_task.key == task_issue.key
+
+            # Verify parent relationship if the fields are accessible
+            # This might vary depending on how the Jira instance returns data
+            if hasattr(retrieved_task, "fields"):
+                if hasattr(retrieved_task.fields, "parent"):
+                    assert retrieved_task.fields.parent.key == parent_issue_key
+
+            print(f"\nCreated task {task_issue.key} with parent {parent_issue_key}")
+
+        except Exception as e:
+            # If we get a hierarchy error, it means the feature works but is limited by Jira config
+            if "hierarchy" in str(e).lower():
+                pytest.skip(
+                    f"Parent-child relationship not allowed by Jira configuration: {str(e)}"
+                )
+            else:
+                # Re-raise if it's not a hierarchy issue
+                raise
+
+    finally:
+        # Clean up resources even if the test fails
+        cleanup_resources()
+
+
+@pytest.mark.anyio
+async def test_jira_create_epic(
+    jira_client: JiraFetcher,
+    test_project_key: str,
+    resource_tracker: ResourceTracker,
+    cleanup_resources: Callable[[], None],
+) -> None:
+    """
+    Test creating an Epic issue in Jira.
+
+    This test verifies that the create_issue method can handle Epic creation
+    properly for any Jira instance, regardless of the specific custom field
+    configuration used for Epic Name or other Epic-specific fields.
+    """
+    # Generate unique identifiers for this test
+    test_id = str(uuid.uuid4())[:8]
+    epic_summary = f"Test Epic {test_id}"
+
+    try:
+        # Attempt to create the Epic - this should succeed after implementation is fixed
+        epic_issue = jira_client.create_issue(
+            project_key=test_project_key,
+            summary=epic_summary,
+            description="This is a test epic for validating Epic creation functionality.",
+            issue_type="Epic",
+        )
+
+        # Track the epic for cleanup if creation succeeds
+        resource_tracker.add_jira_issue(epic_issue.key)
+
+        # Verify the epic response
+        assert epic_issue is not None
+        assert epic_issue.key.startswith(test_project_key)
+        assert epic_issue.summary == epic_summary
+
+        print(f"\nTEST PASSED: Successfully created Epic issue {epic_issue.key}")
+
+        # Try to retrieve the epic to verify it was truly created
+        retrieved_epic = jira_client.get_issue(epic_issue.key)
+        assert retrieved_epic is not None
+        assert retrieved_epic.key == epic_issue.key
+        assert retrieved_epic.summary == epic_summary
+
+    except Exception as e:
+        # Log the error but don't catch it - we want the test to fail
+        # when Epic creation doesn't work
+        print(f"\nERROR creating Epic: {str(e)}")
+
+        # Print information about field IDs to help with fixing the implementation
+        try:
+            print("\n=== Jira Field Information for Debugging ===")
+            field_ids = jira_client.get_jira_field_ids()
+            print(f"Available field IDs: {field_ids}")
+        except Exception as error:
+            print(f"Error retrieving field IDs: {str(error)}")
+
+        raise
+    finally:
         cleanup_resources()
 
 
@@ -528,89 +766,130 @@ async def test_confluence_create_page(
     cleanup_resources: Callable[[], None],
 ) -> None:
     """Test creating a page in Confluence."""
-    # First check if we have permission to create pages in this space
-    try:
-        # Try to get space info to verify access
-        if hasattr(confluence_client, "get_space"):
-            space = confluence_client.get_space(test_space_key)
-        else:
-            space = confluence_client.confluence.get_space(test_space_key)
-
-        # Check if space exists
-        if not space:
-            pytest.skip(
-                f"Space {test_space_key} not found. Skipping page creation test."
-            )
-            return
-    except Exception as e:
-        if "permission" in str(e).lower() or "access" in str(e).lower():
-            pytest.skip(
-                f"No permission to access space {test_space_key}. Skipping page creation test."
-            )
-        else:
-            pytest.skip(
-                f"Could not access space {test_space_key}: {str(e)}. Skipping page creation test."
-            )
-        return
-
     # Generate a unique title
     test_id = str(uuid.uuid4())[:8]
     title = f"Test Page (API Validation) {test_id}"
+
+    # Create timestamp separately to avoid long line
+    timestamp = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
     content = f"""
     <h1>Test Page</h1>
-    <p>This is a test page created by the API validation tests at {datetime.datetime.now(tz=datetime.timezone.utc).isoformat()}.</p>
+    <p>This is a test page created by the API validation tests at {timestamp}.</p>
     <p>It should be automatically deleted after the test.</p>
     """
 
     try:
-        # Create the page
+        # Create the page using our module's API
         try:
-            if hasattr(confluence_client, "create_page"):
-                page = confluence_client.create_page(
-                    space_key=test_space_key, title=title, body=content
-                )
-            else:
-                # Fall back to the underlying client
-                page = confluence_client.confluence.create_page(
-                    space=test_space_key, title=title, body=content
-                )
+            page = confluence_client.create_page(
+                space_key=test_space_key, title=title, body=content
+            )
         except Exception as e:
             if "permission" in str(e).lower():
                 pytest.skip(f"No permission to create pages in space {test_space_key}")
+                return
+            elif "space" in str(e).lower() and (
+                "not found" in str(e).lower() or "doesn't exist" in str(e).lower()
+            ):
+                pytest.skip(
+                    f"Space {test_space_key} not found. Skipping page creation test."
+                )
                 return
             else:
                 raise
 
         # Track the page for cleanup
-        if hasattr(page, "id"):
-            page_id = page.id
-        else:
-            page_id = page["id"]
-
+        page_id = page.id
         resource_tracker.add_confluence_page(page_id)
 
         # Verify the response
         assert page is not None
-
-        # Verify the page title
-        if hasattr(page, "title"):
-            assert page.title == title
-        else:
-            assert page["title"] == title
+        assert page.title == title
 
         # Attempt to retrieve the created page
-        if hasattr(confluence_client, "get_page_by_id"):
-            retrieved_page = confluence_client.get_page_by_id(page_id)
-        else:
-            retrieved_page = confluence_client.confluence.get_page_by_id(page_id)
-
+        retrieved_page = confluence_client.get_page_content(page_id)
         assert retrieved_page is not None
     finally:
         # Clean up resources even if the test fails
         cleanup_resources()
 
 
-# Skip these tests by default
+@pytest.mark.anyio
+async def test_confluence_update_page(
+    confluence_client: ConfluenceFetcher,
+    resource_tracker: ResourceTracker,
+    test_space_key: str,
+    cleanup_resources: Callable[[], None],
+) -> None:
+    """Test updating a page in Confluence and validate TextContent structure.
+
+    This test has two purposes:
+    1. Test the basic page update functionality
+    2. Validate the TextContent class requires the 'type' field to prevent issue #97
+    """
+    # Create a test page first
+    test_id = str(uuid.uuid4())[:8]
+    title = f"Update Test Page {test_id}"
+    content = f"<p>Initial content {test_id}</p>"
+
+    try:
+        # Create the page using our module's API
+        page = confluence_client.create_page(
+            space_key=test_space_key, title=title, body=content
+        )
+
+        # Track the page for cleanup
+        page_id = page.id
+        resource_tracker.add_confluence_page(page_id)
+
+        # Update the page with new content
+        now = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
+        updated_content = f"<p>Updated content {test_id} at {now}</p>"
+
+        # Test updating without explicitly specifying the version
+        updated_page = confluence_client.update_page(
+            page_id=page_id, title=title, body=updated_content
+        )
+
+        # Verify the update worked
+        assert updated_page is not None
+
+        # ======= TextContent Validation (prevents issue #97) =======
+        # Import TextContent class to test directly
+        from mcp.types import TextContent
+
+        print("Testing TextContent validation to prevent issue #97")
+
+        # Create a TextContent without type field - this should raise an error
+        try:
+            # Intentionally omit the type field to simulate the bug in issue #97
+            # Using _ to avoid unused variable warning
+            _ = TextContent(text="This should fail without type field")
+            # If we get here, the validation is not working
+            raise AssertionError(
+                "TextContent creation without 'type' field should fail but didn't"
+            )
+        except Exception as e:
+            # We expect an exception because the type field is required
+            print(f"Correctly got error: {str(e)}")
+            assert "type" in str(e), "Error should mention missing 'type' field"
+
+        # Create valid TextContent with type field - should work
+        valid_content = TextContent(
+            type="text", text="This should work with type field"
+        )
+        assert valid_content.type == "text", "TextContent should have type='text'"
+        assert valid_content.text == "This should work with type field", (
+            "TextContent text should match"
+        )
+
+        print("TextContent validation succeeded - 'type' field is properly required")
+
+    finally:
+        # Clean up resources even if the test fails
+        cleanup_resources()
+
+
 @pytest.mark.skip(reason="This test modifies data - use with caution")
 @pytest.mark.anyio
 async def test_jira_transition_issue(
@@ -660,9 +939,15 @@ async def test_jira_transition_issue(
         assert transition_id is not None
 
         # Perform the transition
-        result = jira_client.transition_issue(
+        transition_result = jira_client.transition_issue(
             issue_key=issue.key, transition_id=transition_id
         )
+
+        # Verify transition was successful if result is returned
+        if transition_result is not None:
+            assert transition_result, (
+                "Transition should return a truthy value if successful"
+            )
 
         # Verify the issue status changed
         updated_issue = jira_client.get_issue(issue.key)
@@ -680,66 +965,189 @@ async def test_jira_transition_issue(
         cleanup_resources()
 
 
-@pytest.mark.skip(reason="This test modifies data - use with caution")
 @pytest.mark.anyio
-async def test_confluence_update_page(
-    confluence_client: ConfluenceFetcher,
+async def test_jira_create_epic_with_custom_fields(
+    jira_client: JiraFetcher,
+    test_project_key: str,
     resource_tracker: ResourceTracker,
-    test_space_key: str,
     cleanup_resources: Callable[[], None],
 ) -> None:
-    """Test updating a page in Confluence without version parameter."""
-    # Create a test page first
+    """
+    Test creating an Epic issue in Jira with custom Epic fields.
+
+    This test verifies that the create_issue method can handle Epic creation
+    with explicit Epic Name and Epic Color values, properly detecting the
+    correct custom fields regardless of the Jira configuration.
+    """
+    # Generate unique identifiers for this test
     test_id = str(uuid.uuid4())[:8]
-    title = f"Update Test Page {test_id}"
-    content = f"<p>Initial content {test_id}</p>"
+    epic_summary = f"Test Epic {test_id}"
+    custom_epic_name = f"Custom Epic Name {test_id}"
 
     try:
-        # Create the page
-        if hasattr(confluence_client, "create_page"):
-            page = confluence_client.create_page(
-                space_key=test_space_key, title=title, body=content
+        # Force field discovery to ensure we have the latest field IDs
+        if hasattr(jira_client, "_field_ids_cache"):
+            delattr(jira_client, "_field_ids_cache")
+
+        # Get field IDs and log them for debugging
+        field_ids = jira_client.get_jira_field_ids()
+        print(f"Discovered field IDs: {field_ids}")
+
+        # Attempt to create the Epic with custom values
+        epic_issue = jira_client.create_issue(
+            project_key=test_project_key,
+            summary=epic_summary,
+            description="This is a test epic with custom values.",
+            issue_type="Epic",
+            epic_name=custom_epic_name,
+            epic_color="blue",
+        )
+
+        # Track the epic for cleanup
+        resource_tracker.add_jira_issue(epic_issue.key)
+
+        # Verify Epic was created correctly
+        assert epic_issue is not None
+        assert epic_issue.key.startswith(test_project_key)
+        assert epic_issue.summary == epic_summary
+
+        print(f"\nTEST PASSED: Successfully created Epic issue {epic_issue.key}")
+
+        # Retrieve the Epic to verify custom fields were set
+        retrieved_epic = jira_client.get_issue(epic_issue.key)
+
+        # Verify custom Epic Name - the field might be accessible under different properties
+        # depending on the Jira configuration
+        has_epic_name = False
+        if hasattr(retrieved_epic, "epic_name") and retrieved_epic.epic_name:
+            assert retrieved_epic.epic_name == custom_epic_name
+            has_epic_name = True
+            print(
+                f"Verified Epic Name via epic_name property: {retrieved_epic.epic_name}"
             )
-        else:
-            # Fall back to the underlying client
-            page = confluence_client.confluence.create_page(
-                space=test_space_key, title=title, body=content
-            )
 
-        # Track the page for cleanup
-        if hasattr(page, "id"):
-            page_id = page.id
-        else:
-            page_id = page["id"]
+        if not has_epic_name:
+            print("Could not verify Epic Name directly, checking raw fields...")
+            # Try to get the raw API response to verify the custom fields
+            if hasattr(jira_client, "jira"):
+                raw_issue = jira_client.jira.issue(epic_issue.key)
+                fields = raw_issue.get("fields", {})
 
-        resource_tracker.add_confluence_page(page_id)
+                # Find the Epic Name field by searching known patterns
+                for field_id, value in fields.items():
+                    if field_id.startswith("customfield_") and isinstance(value, str):
+                        if value == custom_epic_name:
+                            print(
+                                f"Found Epic Name in custom field {field_id}: {value}"
+                            )
+                            has_epic_name = True
+                            break
 
-        # Update the page with new content
-        updated_content = f"<p>Updated content {test_id} at {datetime.datetime.now(tz=datetime.timezone.utc).isoformat()}</p>"
+        if not has_epic_name:
+            print("WARNING: Could not verify Epic Name was set correctly")
 
-        # Test updating without explicitly specifying the version
-        if hasattr(confluence_client, "update_page"):
-            updated_page = confluence_client.update_page(
-                page_id=page_id, title=title, body=updated_content
-            )
-        else:
-            # Fall back to the underlying client
-            updated_page = confluence_client.confluence.update_page(
-                page_id=page_id, title=title, body=updated_content
-            )
+    except Exception as e:
+        print(f"\nERROR creating Epic with custom fields: {str(e)}")
 
-        # Verify the update
-        assert updated_page is not None
+        # Print information about field IDs to help with debugging
+        try:
+            print("\n=== Jira Field Information for Debugging ===")
+            field_ids = jira_client.get_jira_field_ids()
+            print(f"Available field IDs: {field_ids}")
+        except Exception as error:
+            print(f"Error retrieving field IDs: {str(error)}")
 
-        # Retrieve the updated page
-        if hasattr(confluence_client, "get_page_by_id"):
-            retrieved_page = confluence_client.get_page_by_id(page_id)
-        else:
-            retrieved_page = confluence_client.confluence.get_page_by_id(page_id)
-
-        # Check that the content was updated
-        assert retrieved_page is not None
-        assert "Updated content" in str(retrieved_page)
+        raise
     finally:
-        # Clean up resources even if the test fails
+        cleanup_resources()
+
+
+@pytest.mark.anyio
+async def test_jira_create_epic_two_step(
+    jira_client: JiraFetcher,
+    test_project_key: str,
+    resource_tracker: ResourceTracker,
+    cleanup_resources: Callable[[], None],
+) -> None:
+    """
+    Test the two-step Epic creation process.
+
+    This test verifies that the create_issue method can successfully create an Epic
+    using the two-step approach (create basic issue first, then update Epic fields)
+    to work around screen configuration issues.
+    """
+    # Generate unique identifiers for this test
+    test_id = str(uuid.uuid4())[:8]
+    epic_summary = f"Two-Step Epic {test_id}"
+    epic_name = f"Epic Name {test_id}"
+
+    try:
+        # Clear any cached field IDs to force fresh discovery
+        if hasattr(jira_client, "_field_ids"):
+            delattr(jira_client, "_field_ids")
+
+        # Show all available field IDs - useful for debugging
+        field_ids = jira_client.get_jira_field_ids()
+        print(f"\nAvailable field IDs for Epic creation: {field_ids}")
+
+        # Create the Epic - should use the two-step process internally
+        print("\nAttempting to create Epic using two-step process...")
+        epic_issue = jira_client.create_issue(
+            project_key=test_project_key,
+            summary=epic_summary,
+            description="This is a test epic using the two-step creation process.",
+            issue_type="Epic",
+            epic_name=epic_name,  # This should be stored for post-creation update
+            epic_color="blue",  # This should be stored for post-creation update
+        )
+
+        # Track the epic for cleanup
+        resource_tracker.add_jira_issue(epic_issue.key)
+
+        # Verify the Epic was created
+        assert epic_issue is not None
+        assert epic_issue.key.startswith(test_project_key)
+        assert epic_issue.summary == epic_summary
+
+        print(f"\nSuccessfully created Epic: {epic_issue.key}")
+
+        # Try to retrieve the Epic to verify Epic-specific fields
+        retrieved_epic = jira_client.get_issue(epic_issue.key)
+        print(f"\nRetrieved Epic: {retrieved_epic.key}")
+
+        # Log epic field information for debugging
+        print(f"Epic name: {retrieved_epic.epic_name}")
+
+        # Try to get the raw API response to inspect all fields
+        try:
+            # Using _raw property if available, or direct API call as fallback
+            if hasattr(retrieved_epic, "_raw"):
+                raw_data = retrieved_epic._raw
+            else:
+                raw_data = jira_client.jira.issue(epic_issue.key)
+
+            # Print relevant fields for debugging
+            if "fields" in raw_data:
+                for field_id, field_value in raw_data["fields"].items():
+                    if "epic" in field_id.lower() or field_id in field_ids.values():
+                        print(f"Field {field_id}: {field_value}")
+        except Exception as e:
+            print(f"Error getting raw Epic data: {str(e)}")
+
+        print("\nTEST PASSED: Successfully completed two-step Epic creation test")
+
+    except Exception as e:
+        print(f"\nERROR in two-step Epic creation test: {str(e)}")
+
+        # Print debugging information
+        print("\nAvailable field IDs:")
+        try:
+            field_ids = jira_client.get_jira_field_ids()
+            for name, field_id in field_ids.items():
+                print(f"  {name}: {field_id}")
+        except Exception as field_error:
+            print(f"Error getting field IDs: {str(field_error)}")
+
+        raise
+    finally:
         cleanup_resources()

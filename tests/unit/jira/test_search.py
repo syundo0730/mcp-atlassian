@@ -53,7 +53,11 @@ class TestSearchMixin:
 
         # Verify
         search_mixin.jira.jql.assert_called_once_with(
-            "project = TEST", fields="*all", start=0, limit=50, expand=None
+            "project = TEST",
+            fields="summary,description,status,assignee,reporter,labels,priority,created,updated,issuetype",
+            start=0,
+            limit=50,
+            expand=None,
         )
 
         # Verify results
@@ -164,6 +168,108 @@ class TestSearchMixin:
         # Call the method and verify it raises the expected exception
         with pytest.raises(Exception, match="Error searching issues"):
             search_mixin.search_issues("project = TEST")
+
+    def test_search_issues_with_projects_filter(self, search_mixin):
+        """Test search with projects filter."""
+        # Setup mock response
+        mock_issues = {
+            "issues": [
+                {
+                    "id": "10001",
+                    "key": "TEST-123",
+                    "fields": {
+                        "summary": "Test issue",
+                        "issuetype": {"name": "Bug"},
+                        "status": {"name": "Open"},
+                    },
+                }
+            ],
+            "total": 1,
+            "startAt": 0,
+            "maxResults": 50,
+        }
+        search_mixin.jira.jql.return_value = mock_issues
+        search_mixin.config.url = "https://example.atlassian.net"
+
+        # Test with single project filter
+        result = search_mixin.search_issues("text ~ 'test'", projects_filter="TEST")
+        search_mixin.jira.jql.assert_called_with(
+            "(text ~ 'test') AND project = TEST",
+            fields="summary,description,status,assignee,reporter,labels,priority,created,updated,issuetype",
+            start=0,
+            limit=50,
+            expand=None,
+        )
+        assert len(result) == 1
+
+        # Test with multiple projects filter
+        result = search_mixin.search_issues("text ~ 'test'", projects_filter="TEST,DEV")
+        search_mixin.jira.jql.assert_called_with(
+            '(text ~ \'test\') AND project IN ("TEST", "DEV")',
+            fields="summary,description,status,assignee,reporter,labels,priority,created,updated,issuetype",
+            start=0,
+            limit=50,
+            expand=None,
+        )
+        assert len(result) == 1
+
+        # Test with filter when query already has project
+        result = search_mixin.search_issues(
+            "project = EXISTING", projects_filter="TEST"
+        )
+        search_mixin.jira.jql.assert_called_with(
+            "project = EXISTING",  # Should not add filter when project already exists
+            fields="summary,description,status,assignee,reporter,labels,priority,created,updated,issuetype",
+            start=0,
+            limit=50,
+            expand=None,
+        )
+        assert len(result) == 1
+
+    def test_search_issues_with_config_projects_filter(self, search_mixin):
+        """Test search using projects filter from config."""
+        # Setup mock response
+        mock_issues = {
+            "issues": [
+                {
+                    "id": "10001",
+                    "key": "TEST-123",
+                    "fields": {
+                        "summary": "Test issue",
+                        "issuetype": {"name": "Bug"},
+                        "status": {"name": "Open"},
+                    },
+                }
+            ],
+            "total": 1,
+            "startAt": 0,
+            "maxResults": 50,
+        }
+        search_mixin.jira.jql.return_value = mock_issues
+        search_mixin.config.url = "https://example.atlassian.net"
+        search_mixin.config.projects_filter = "TEST,DEV"
+
+        # Test with config filter
+        result = search_mixin.search_issues("text ~ 'test'")
+        search_mixin.jira.jql.assert_called_with(
+            '(text ~ \'test\') AND project IN ("TEST", "DEV")',
+            fields="summary,description,status,assignee,reporter,labels,priority,created,updated,issuetype",
+            start=0,
+            limit=50,
+            expand=None,
+        )
+        assert len(result) == 1
+
+        # Test that explicit filter overrides config filter
+        result = search_mixin.search_issues("text ~ 'test'", projects_filter="OVERRIDE")
+        search_mixin.jira.jql.assert_called_with(
+            "(text ~ 'test') AND project = OVERRIDE",
+            fields="summary,description,status,assignee,reporter,labels,priority,created,updated,issuetype",
+            start=0,
+            limit=50,
+            expand=None,
+        )
+        assert len(result) == 1
 
     def test_get_project_issues(self, search_mixin):
         """Test get_project_issues method."""
@@ -285,9 +391,85 @@ class TestSearchMixin:
             search_mixin.get_epic_issues("EPIC-1")
 
     def test_parse_date(self, search_mixin):
-        """Test _parse_date method."""
-        # Test with various date formats
-        assert search_mixin._parse_date("2024-01-01T12:34:56.789+0000") == "2024-01-01"
-        assert (
-            search_mixin._parse_date("invalid date") == "invalid date"
-        )  # Doesn't crash
+        """Test the _parse_date method."""
+        # Test with a valid ISO date
+        result = search_mixin._parse_date("2023-01-15T14:30:45.123+0000")
+        assert result == "2023-01-15"
+
+        # Test with an empty string
+        result = search_mixin._parse_date("")
+        assert result == ""
+
+    def test_search_issues_with_fields_parameter(self, search_mixin):
+        """Test search with specific fields parameter, including custom fields."""
+        # Setup mock response with a custom field
+        mock_issues = {
+            "issues": [
+                {
+                    "id": "10001",
+                    "key": "TEST-123",
+                    "fields": {
+                        "summary": "Test issue with custom field",
+                        "assignee": {
+                            "displayName": "Test User",
+                            "emailAddress": "test@example.com",
+                            "active": True,
+                        },
+                        "customfield_10049": "Custom value",
+                        "issuetype": {"name": "Bug"},
+                        "status": {"name": "Open"},
+                        "description": "Issue description",
+                        "created": "2024-01-01T10:00:00.000+0000",
+                        "updated": "2024-01-01T11:00:00.000+0000",
+                        "priority": {"name": "High"},
+                    },
+                }
+            ],
+            "total": 1,
+            "startAt": 0,
+            "maxResults": 50,
+        }
+        search_mixin.jira.jql.return_value = mock_issues
+        search_mixin.config.url = "https://example.atlassian.net"
+
+        # Call the method with specific fields
+        result = search_mixin.search_issues(
+            "project = TEST", fields="summary,assignee,customfield_10049"
+        )
+
+        # Verify the JQL call includes the fields parameter
+        search_mixin.jira.jql.assert_called_once_with(
+            "project = TEST",
+            fields="summary,assignee,customfield_10049",
+            start=0,
+            limit=50,
+            expand=None,
+        )
+
+        # Verify results
+        assert isinstance(result, list)
+        assert len(result) == 1
+        issue = result[0]
+
+        # Convert to simplified dict to check field filtering
+        simplified = issue.to_simplified_dict()
+
+        # These fields should be included (plus id and key which are always included)
+        assert "id" in simplified
+        assert "key" in simplified
+        assert "summary" in simplified
+        assert "assignee" in simplified
+        assert "customfield_10049" in simplified
+
+        # These fields should NOT be included
+        assert "description" not in simplified
+        assert "status" not in simplified
+        assert "issue_type" not in simplified
+        assert "priority" not in simplified
+        assert "created" not in simplified
+        assert "updated" not in simplified
+
+        # Verify the values of included fields
+        assert simplified["summary"] == "Test issue with custom field"
+        assert simplified["assignee"]["name"] == "Test User"
+        assert simplified["customfield_10049"] == "Custom value"

@@ -8,11 +8,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from mcp.server import Server
-from mcp.types import Resource, TextContent, Tool
+from mcp.types import Resource, TextContent, Tool, Prompt, PromptMessage, GetPromptResult
 
 from .confluence import ConfluenceFetcher
 from .jira import JiraFetcher
-from .preprocessing import markdown_to_confluence_storage
+from .utils.io import is_read_only_mode
+from .utils.urls import is_atlassian_cloud_url
 
 # Configure logging
 logger = logging.getLogger("mcp-atlassian")
@@ -28,19 +29,36 @@ class AppContext:
 
 def get_available_services() -> dict[str, bool | None]:
     """Determine which services are available based on environment variables."""
-    confluence_vars = all(
-        [
-            os.getenv("CONFLUENCE_URL"),
-            os.getenv("CONFLUENCE_USERNAME"),
-            os.getenv("CONFLUENCE_API_TOKEN"),
-        ]
-    )
+
+    # Check for either cloud authentication (URL + username + API token)
+    # or server/data center authentication (URL + personal token)
+    confluence_url = os.getenv("CONFLUENCE_URL")
+    if confluence_url:
+        is_cloud = is_atlassian_cloud_url(confluence_url)
+
+        if is_cloud:
+            confluence_vars = all(
+                [
+                    confluence_url,
+                    os.getenv("CONFLUENCE_USERNAME"),
+                    os.getenv("CONFLUENCE_API_TOKEN"),
+                ]
+            )
+            logger.info("Using Confluence Cloud authentication method")
+        else:
+            confluence_vars = all(
+                [confluence_url, os.getenv("CONFLUENCE_PERSONAL_TOKEN")]
+            )
+            logger.info("Using Confluence Server/Data Center authentication method")
+    else:
+        confluence_vars = False
 
     # Check for either cloud authentication (URL + username + API token)
     # or server/data center authentication (URL + personal token)
     jira_url = os.getenv("JIRA_URL")
     if jira_url:
-        is_cloud = "atlassian.net" in jira_url
+        is_cloud = is_atlassian_cloud_url(jira_url)
+
         if is_cloud:
             jira_vars = all(
                 [jira_url, os.getenv("JIRA_USERNAME"), os.getenv("JIRA_API_TOKEN")]
@@ -68,10 +86,17 @@ async def server_lifespan(server: Server) -> AsyncIterator[AppContext]:
 
         # Log the startup information
         logger.info("Starting MCP Atlassian server")
+
+        # Log read-only mode status
+        read_only = is_read_only_mode()
+        logger.info(f"Read-only mode: {'ENABLED' if read_only else 'DISABLED'}")
+
         if confluence:
-            logger.info(f"Confluence URL: {confluence.config.url}")
+            confluence_url = confluence.config.url
+            logger.info(f"Confluence URL: {confluence_url}")
         if jira:
-            logger.info(f"Jira URL: {jira.config.url}")
+            jira_url = jira.config.url
+            logger.info(f"Jira URL: {jira_url}")
 
         # Provide context to the application
         yield AppContext(confluence=confluence, jira=jira)
@@ -82,6 +107,41 @@ async def server_lifespan(server: Server) -> AsyncIterator[AppContext]:
 
 # Create server instance
 app = Server("mcp-atlassian", lifespan=server_lifespan)
+
+
+@app.list_prompts()
+async def list_prompts() -> list[Prompt]:
+    """List available prompts."""
+    return [
+        Prompt(
+            name="confluence_image_storage_format",
+            description="Format to insert images into Confluence pages",
+        )
+    ]
+
+
+@app.get_prompt()
+async def get_prompt(name: str, arguments: dict[str, str] | None = None) -> GetPromptResult:
+    """Get a prompt."""
+    if name == "confluence_image_storage_format":
+        return GetPromptResult(
+            messages=[
+                PromptMessage(
+                    role="user",
+                    content=TextContent(
+                        type="text",
+                        text="""use this confluence image storage format to insert the image into the page
+                        <ac:image ac:align="center" ac:layout="center" ac:original-height="387" 
+                        ac:original-width="607" ac:custom-width="true" ac:alt="image-20241203-032414.png" 
+                        ac:width="363">
+                        <ri:attachment ri:filename="image-20241203-032414.png" ri:version-at-save="1" />
+                        </ac:image>"""
+                    ),
+                )
+            ]
+        )
+
+    raise ValueError(f"Prompt {name}'s implementation is not found")
 
 
 # Implement server handlers
@@ -279,19 +339,23 @@ async def list_tools() -> list[Tool]:
     tools = []
     ctx = app.request_context.lifespan_context
 
+    # Check if we're in read-only mode
+    read_only = is_read_only_mode()
+
     # Add Confluence tools if Confluence is configured
     if ctx and ctx.confluence:
+        # Always add read operations
         tools.extend(
             [
                 Tool(
                     name="confluence_search",
-                    description="Search Confluence content using CQL",
+                    description="Search Confluence content using simple terms or CQL",
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "CQL query string (Confluence Query Language). Examples:\n"
+                                "description": "Search query - can be either a simple text (e.g. 'project documentation') or a CQL query string. Examples of CQL:\n"
                                 "- Basic search: 'type=page AND space=DEV'\n"
                                 "- Search by title: 'title~\"Meeting Notes\"'\n"
                                 "- Recent content: 'created >= \"2023-01-01\"'\n"
@@ -309,6 +373,10 @@ async def list_tools() -> list[Tool]:
                                 "default": 10,
                                 "minimum": 1,
                                 "maximum": 50,
+                            },
+                            "spaces_filter": {
+                                "type": "string",
+                                "description": "Comma-separated list of space keys to filter results by. Overrides the environment variable CONFLUENCE_SPACES_FILTER if provided.",
                             },
                         },
                         "required": ["query"],
@@ -331,6 +399,56 @@ async def list_tools() -> list[Tool]:
                                 "description": "Whether to include page metadata such as creation date, last update, version, and labels",
                                 "default": True,
                             },
+                            "convert_to_markdown": {
+                                "type": "boolean",
+                                "description": "Whether to convert page to markdown (true) or keep it in raw HTML format (false). Raw HTML can reveal macros (like dates) not visible in markdown, but CAUTION: using HTML significantly increases token usage in AI responses.",
+                                "default": True,
+                            },
+                        },
+                        "required": ["page_id"],
+                    },
+                ),
+                Tool(
+                    name="confluence_get_page_children",
+                    description="Get child pages of a specific Confluence page",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "parent_id": {
+                                "type": "string",
+                                "description": "The ID of the parent page whose children you want to retrieve",
+                            },
+                            "expand": {
+                                "type": "string",
+                                "description": "Fields to expand in the response (e.g., 'version', 'body.storage')",
+                                "default": "version",
+                            },
+                            "limit": {
+                                "type": "number",
+                                "description": "Maximum number of child pages to return (1-50)",
+                                "default": 25,
+                                "minimum": 1,
+                                "maximum": 50,
+                            },
+                            "include_content": {
+                                "type": "boolean",
+                                "description": "Whether to include the page content in the response",
+                                "default": False,
+                            },
+                        },
+                        "required": ["parent_id"],
+                    },
+                ),
+                Tool(
+                    name="confluence_get_page_ancestors",
+                    description="Get ancestor (parent) pages of a specific Confluence page",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "The ID of the page whose ancestors you want to retrieve",
+                            },
                         },
                         "required": ["page_id"],
                     },
@@ -351,87 +469,177 @@ async def list_tools() -> list[Tool]:
                         "required": ["page_id"],
                     },
                 ),
-                Tool(
-                    name="confluence_create_page",
-                    description="Create a new Confluence page",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "space_key": {
-                                "type": "string",
-                                "description": "The key of the space to create the page in "
-                                "(usually a short uppercase code like 'DEV', 'TEAM', or 'DOC')",
-                            },
-                            "title": {
-                                "type": "string",
-                                "description": "The title of the page",
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "The content of the page in Markdown format. "
-                                "Supports headings, lists, tables, code blocks, and other "
-                                "Markdown syntax",
-                            },
-                            "parent_id": {
-                                "type": "string",
-                                "description": "Optional parent page ID. If provided, this page "
-                                "will be created as a child of the specified page",
-                            },
-                        },
-                        "required": ["space_key", "title", "content"],
-                    },
-                ),
-                Tool(
-                    name="confluence_update_page",
-                    description="Update an existing Confluence page",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "page_id": {
-                                "type": "string",
-                                "description": "The ID of the page to update",
-                            },
-                            "title": {
-                                "type": "string",
-                                "description": "The new title of the page",
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "The new content of the page in Markdown format",
-                            },
-                            "is_minor_edit": {
-                                "type": "boolean",
-                                "description": "Whether this is a minor edit",
-                                "default": False,
-                            },
-                            "version_comment": {
-                                "type": "string",
-                                "description": "Optional comment for this version",
-                                "default": "",
-                            },
-                        },
-                        "required": ["page_id", "title", "content"],
-                    },
-                ),
             ]
         )
 
+        # Only add write operations if not in read-only mode
+        if not read_only:
+            tools.extend(
+                [
+                    Tool(
+                        name="confluence_create_page",
+                        description="Create a new Confluence page",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "space_key": {
+                                    "type": "string",
+                                    "description": "The key of the space to create the page in "
+                                    "(usually a short uppercase code like 'DEV', 'TEAM', or 'DOC')",
+                                },
+                                "title": {
+                                    "type": "string",
+                                    "description": "The title of the page",
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "The content of the page in Markdown format. "
+                                    "Supports headings, lists, tables, code blocks, and other "
+                                    "Markdown syntax",
+                                },
+                                "parent_id": {
+                                    "type": "string",
+                                    "description": "Optional parent page ID. If provided, this page "
+                                    "will be created as a child of the specified page",
+                                },
+                            },
+                            "required": ["space_key", "title", "content"],
+                        },
+                    ),
+                    Tool(
+                        name="confluence_update_page",
+                        description="Update an existing Confluence page",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "page_id": {
+                                    "type": "string",
+                                    "description": "The ID of the page to update",
+                                },
+                                "title": {
+                                    "type": "string",
+                                    "description": "The new title of the page",
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "The new content of the page in Markdown format",
+                                },
+                                "is_minor_edit": {
+                                    "type": "boolean",
+                                    "description": "Whether this is a minor edit",
+                                    "default": False,
+                                },
+                                "version_comment": {
+                                    "type": "string",
+                                    "description": "Optional comment for this version",
+                                    "default": "",
+                                },
+                            },
+                            "required": ["page_id", "title", "content"],
+                        },
+                    ),
+                    Tool(
+                        name="confluence_delete_page",
+                        description="Delete an existing Confluence page",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "page_id": {
+                                    "type": "string",
+                                    "description": "The ID of the page to delete",
+                                },
+                            },
+                            "required": ["page_id"],
+                        },
+                    ),
+                    Tool(
+                        name="confluence_upload_attachment",
+                        description="Upload an attachment to a Confluence page",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "page_id": {
+                                    "type": "string",
+                                    "description": "Confluence page ID to attach the file to",
+                                },
+                                "file_path": {
+                                    "type": "string",
+                                    "description": "Path to the file to upload",
+                                },
+                                "comment": {
+                                    "type": "string",
+                                    "description": "Optional comment for the attachment",
+                                },
+                            },
+                            "required": ["page_id", "file_path"],
+                        },
+                    ),
+                    Tool(
+                        name="confluence_get_attachments",
+                        description="Get attachments from a Confluence page",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "page_id": {
+                                    "type": "string",
+                                    "description": "Confluence page ID to get attachments from",
+                                },
+                                "start": {
+                                    "type": "number",
+                                    "description": "Starting index for pagination",
+                                    "default": 0,
+                                },
+                                "limit": {
+                                    "type": "number",
+                                    "description": "Maximum number of attachments to return (1-100)",
+                                    "default": 50,
+                                    "minimum": 1,
+                                    "maximum": 100,
+                                },
+                            },
+                            "required": ["page_id"],
+                        },
+                    ),
+                    Tool(
+                        name="confluence_delete_attachment",
+                        description="Delete an attachment from a Confluence page by filename",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "page_id": {
+                                    "type": "string",
+                                    "description": "Confluence page ID the attachment belongs to",
+                                },
+                                "filename": {
+                                    "type": "string",
+                                    "description": "Filename of the attachment to delete",
+                                },
+                            },
+                            "required": ["page_id", "filename"],
+                        },
+                    ),
+                ]
+            )
+
     # Add Jira tools if Jira is configured
     if ctx and ctx.jira:
+        # Always add read operations
         tools.extend(
             [
                 Tool(
                     name="jira_get_issue",
-                    description=(
-                        "Get details of a specific Jira issue including its Epic links "
-                        "and relationship information"
-                    ),
+                    description="Get details of a specific Jira issue including its Epic links and relationship information",
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "issue_key": {
                                 "type": "string",
                                 "description": "Jira issue key (e.g., 'PROJ-123')",
+                            },
+                            "fields": {
+                                "type": "string",
+                                "description": "Fields to return. Can be a comma-separated list (e.g., 'summary,status,customfield_10010'), '*all' for all fields (including custom fields), or omitted for essential fields only",
+                                "default": "summary,description,status,assignee,reporter,labels,priority,created,updated,issuetype",
                             },
                             "expand": {
                                 "type": "string",
@@ -450,7 +658,17 @@ async def list_tools() -> list[Tool]:
                                 ),
                                 "minimum": 0,
                                 "maximum": 100,
+                                "default": 10,
+                            },
+                            "properties": {
+                                "type": "string",
+                                "description": "A comma-separated list of issue properties to return",
                                 "default": None,
+                            },
+                            "update_history": {
+                                "type": "boolean",
+                                "description": "Whether to update the issue view history for the requesting user",
+                                "default": True,
                             },
                         },
                         "required": ["issue_key"],
@@ -489,6 +707,10 @@ async def list_tools() -> list[Tool]:
                                 "minimum": 1,
                                 "maximum": 50,
                             },
+                            "projects_filter": {
+                                "type": "string",
+                                "description": "Comma-separated list of project keys to filter results by. Overrides the environment variable JIRA_PROJECTS_FILTER if provided.",
+                            },
                         },
                         "required": ["jql"],
                     },
@@ -512,173 +734,6 @@ async def list_tools() -> list[Tool]:
                             },
                         },
                         "required": ["project_key"],
-                    },
-                ),
-                Tool(
-                    name="jira_create_issue",
-                    description="Create a new Jira issue with optional Epic link",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_key": {
-                                "type": "string",
-                                "description": "The JIRA project key (e.g. 'PROJ', 'DEV', 'SUPPORT'). "
-                                "This is the prefix of issue keys in your project. "
-                                "Never assume what it might be, always ask the user.",
-                            },
-                            "summary": {
-                                "type": "string",
-                                "description": "Summary/title of the issue",
-                            },
-                            "issue_type": {
-                                "type": "string",
-                                "description": (
-                                    "Issue type (e.g. 'Task', 'Bug', 'Story', 'Epic'). "
-                                    "The available types depend on your project configuration."
-                                ),
-                            },
-                            "assignee": {
-                                "type": "string",
-                                "description": "Assignee of the ticket (accountID, full name or e-mail)",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Issue description",
-                                "default": "",
-                            },
-                            "additional_fields": {
-                                "type": "string",
-                                "description": "Optional JSON string of additional fields to set. "
-                                'Example: \'{"priority": {"name": "High"}, "labels": ["frontend", "urgent"], '
-                                '"components": [{"name": "UI"}]}\'',
-                                "default": "{}",
-                            },
-                        },
-                        "required": ["project_key", "summary", "issue_type"],
-                    },
-                ),
-                Tool(
-                    name="jira_update_issue",
-                    description="Update an existing Jira issue including changing status, adding Epic links, updating fields, etc.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "issue_key": {
-                                "type": "string",
-                                "description": "Jira issue key (e.g., 'PROJ-123')",
-                            },
-                            "fields": {
-                                "type": "string",
-                                "description": "A valid JSON object of fields to update as a string. "
-                                'Example: \'{"summary": "New title", "description": "Updated description", '
-                                '"priority": {"name": "High"}, "assignee": {"name": "john.doe"}}\'',
-                            },
-                            "additional_fields": {
-                                "type": "string",
-                                "description": "Optional JSON string of additional fields to update. Use this for custom fields or more complex updates.",
-                                "default": "{}",
-                            },
-                        },
-                        "required": ["issue_key", "fields"],
-                    },
-                ),
-                Tool(
-                    name="jira_delete_issue",
-                    description="Delete an existing Jira issue",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "issue_key": {
-                                "type": "string",
-                                "description": "Jira issue key (e.g. PROJ-123)",
-                            },
-                        },
-                        "required": ["issue_key"],
-                    },
-                ),
-                Tool(
-                    name="jira_add_comment",
-                    description="Add a comment to a Jira issue",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "issue_key": {
-                                "type": "string",
-                                "description": "Jira issue key (e.g., 'PROJ-123')",
-                            },
-                            "comment": {
-                                "type": "string",
-                                "description": "Comment text in Markdown format",
-                            },
-                        },
-                        "required": ["issue_key", "comment"],
-                    },
-                ),
-                Tool(
-                    name="jira_add_worklog",
-                    description="Add a worklog entry to a Jira issue",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "issue_key": {
-                                "type": "string",
-                                "description": "Jira issue key (e.g., 'PROJ-123')",
-                            },
-                            "time_spent": {
-                                "type": "string",
-                                "description": (
-                                    "Time spent in Jira format. Examples: "
-                                    "'1h 30m' (1 hour and 30 minutes), "
-                                    "'1d' (1 day), '30m' (30 minutes), "
-                                    "'4h' (4 hours)"
-                                ),
-                            },
-                            "comment": {
-                                "type": "string",
-                                "description": "Optional comment for the worklog in Markdown format",
-                            },
-                            "started": {
-                                "type": "string",
-                                "description": (
-                                    "Optional start time in ISO format. "
-                                    "If not provided, the current time will be used. "
-                                    "Example: '2023-08-01T12:00:00.000+0000'"
-                                ),
-                            },
-                        },
-                        "required": ["issue_key", "time_spent"],
-                    },
-                ),
-                Tool(
-                    name="jira_get_worklog",
-                    description="Get worklog entries for a Jira issue",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "issue_key": {
-                                "type": "string",
-                                "description": "Jira issue key (e.g., 'PROJ-123')",
-                            },
-                        },
-                        "required": ["issue_key"],
-                    },
-                ),
-                Tool(
-                    name="jira_link_to_epic",
-                    description="Link an existing issue to an epic",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "issue_key": {
-                                "type": "string",
-                                "description": "The key of the issue to link (e.g., 'PROJ-123')",
-                            },
-                            "epic_key": {
-                                "type": "string",
-                                "description": "The key of the epic to link to (e.g., 'PROJ-456')",
-                            },
-                        },
-                        "required": ["issue_key", "epic_key"],
                     },
                 ),
                 Tool(
@@ -717,8 +772,8 @@ async def list_tools() -> list[Tool]:
                     },
                 ),
                 Tool(
-                    name="jira_transition_issue",
-                    description="Transition a Jira issue to a new status",
+                    name="jira_get_worklog",
+                    description="Get worklog entries for a Jira issue",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -726,36 +781,233 @@ async def list_tools() -> list[Tool]:
                                 "type": "string",
                                 "description": "Jira issue key (e.g., 'PROJ-123')",
                             },
-                            "transition_id": {
+                        },
+                        "required": ["issue_key"],
+                    },
+                ),
+                Tool(
+                    name="jira_download_attachments",
+                    description="Download attachments from a Jira issue",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "issue_key": {
                                 "type": "string",
-                                "description": (
-                                    "ID of the transition to perform. Use the jira_get_transitions tool first "
-                                    "to get the available transition IDs for the issue. "
-                                    "Example values: '11', '21', '31'"
-                                ),
+                                "description": "Jira issue key (e.g., 'PROJ-123')",
                             },
-                            "fields": {
+                            "target_dir": {
                                 "type": "string",
-                                "description": (
-                                    "JSON string of fields to update during the transition. "
-                                    "Some transitions require specific fields to be set. "
-                                    'Example: \'{"resolution": {"name": "Fixed"}}\''
-                                ),
-                                "default": "{}",
-                            },
-                            "comment": {
-                                "type": "string",
-                                "description": (
-                                    "Comment to add during the transition (optional). "
-                                    "This will be visible in the issue history."
-                                ),
+                                "description": "Directory where attachments should be saved",
                             },
                         },
-                        "required": ["issue_key", "transition_id"],
+                        "required": ["issue_key", "target_dir"],
                     },
                 ),
             ]
         )
+
+        # Only add write operations if not in read-only mode
+        if not read_only:
+            tools.extend(
+                [
+                    Tool(
+                        name="jira_create_issue",
+                        description="Create a new Jira issue with optional Epic link or parent for subtasks",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "project_key": {
+                                    "type": "string",
+                                    "description": "The JIRA project key (e.g. 'PROJ', 'DEV', 'SUPPORT'). "
+                                    "This is the prefix of issue keys in your project. "
+                                    "Never assume what it might be, always ask the user.",
+                                },
+                                "summary": {
+                                    "type": "string",
+                                    "description": "Summary/title of the issue",
+                                },
+                                "issue_type": {
+                                    "type": "string",
+                                    "description": (
+                                        "Issue type (e.g. 'Task', 'Bug', 'Story', 'Epic', 'Subtask'). "
+                                        "The available types depend on your project configuration. "
+                                        "For subtasks, use 'Subtask' (not 'Sub-task') and include parent in additional_fields."
+                                    ),
+                                },
+                                "assignee": {
+                                    "type": "string",
+                                    "description": "Assignee of the ticket (accountID, full name or e-mail)",
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "Issue description",
+                                    "default": "",
+                                },
+                                "additional_fields": {
+                                    "type": "string",
+                                    "description": "Optional JSON string of additional fields to set. "
+                                    "Examples:\n"
+                                    '- Set priority: {"priority": {"name": "High"}}\n'
+                                    '- Add labels: {"labels": ["frontend", "urgent"]}\n'
+                                    '- Add components: {"components": [{"name": "UI"}]}\n'
+                                    '- Link to parent (for any issue type): {"parent": "PROJ-123"}\n'
+                                    '- Custom fields: {"customfield_10010": "value"}',
+                                    "default": "{}",
+                                },
+                            },
+                            "required": ["project_key", "summary", "issue_type"],
+                        },
+                    ),
+                    Tool(
+                        name="jira_update_issue",
+                        description="Update an existing Jira issue including changing status, adding Epic links, updating fields, etc.",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "issue_key": {
+                                    "type": "string",
+                                    "description": "Jira issue key (e.g., 'PROJ-123')",
+                                },
+                                "fields": {
+                                    "type": "string",
+                                    "description": "A valid JSON object of fields to update as a string. "
+                                    'Example: \'{"summary": "New title", "description": "Updated description", '
+                                    '"priority": {"name": "High"}, "assignee": {"name": "john.doe"}}\'',
+                                },
+                                "additional_fields": {
+                                    "type": "string",
+                                    "description": "Optional JSON string of additional fields to update. Use this for custom fields or more complex updates.",
+                                    "default": "{}",
+                                },
+                            },
+                            "required": ["issue_key", "fields"],
+                        },
+                    ),
+                    Tool(
+                        name="jira_delete_issue",
+                        description="Delete an existing Jira issue",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "issue_key": {
+                                    "type": "string",
+                                    "description": "Jira issue key (e.g. PROJ-123)",
+                                },
+                            },
+                            "required": ["issue_key"],
+                        },
+                    ),
+                    Tool(
+                        name="jira_add_comment",
+                        description="Add a comment to a Jira issue",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "issue_key": {
+                                    "type": "string",
+                                    "description": "Jira issue key (e.g., 'PROJ-123')",
+                                },
+                                "comment": {
+                                    "type": "string",
+                                    "description": "Comment text in Markdown format",
+                                },
+                            },
+                            "required": ["issue_key", "comment"],
+                        },
+                    ),
+                    Tool(
+                        name="jira_add_worklog",
+                        description="Add a worklog entry to a Jira issue",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "issue_key": {
+                                    "type": "string",
+                                    "description": "Jira issue key (e.g., 'PROJ-123')",
+                                },
+                                "time_spent": {
+                                    "type": "string",
+                                    "description": (
+                                        "Time spent in Jira format. Examples: "
+                                        "'1h 30m' (1 hour and 30 minutes), "
+                                        "'1d' (1 day), '30m' (30 minutes), "
+                                        "'4h' (4 hours)"
+                                    ),
+                                },
+                                "comment": {
+                                    "type": "string",
+                                    "description": "Optional comment for the worklog in Markdown format",
+                                },
+                                "started": {
+                                    "type": "string",
+                                    "description": (
+                                        "Optional start time in ISO format. "
+                                        "If not provided, the current time will be used. "
+                                        "Example: '2023-08-01T12:00:00.000+0000'"
+                                    ),
+                                },
+                            },
+                            "required": ["issue_key", "time_spent"],
+                        },
+                    ),
+                    Tool(
+                        name="jira_link_to_epic",
+                        description="Link an existing issue to an epic",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "issue_key": {
+                                    "type": "string",
+                                    "description": "The key of the issue to link (e.g., 'PROJ-123')",
+                                },
+                                "epic_key": {
+                                    "type": "string",
+                                    "description": "The key of the epic to link to (e.g., 'PROJ-456')",
+                                },
+                            },
+                            "required": ["issue_key", "epic_key"],
+                        },
+                    ),
+                    Tool(
+                        name="jira_transition_issue",
+                        description="Transition a Jira issue to a new status",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "issue_key": {
+                                    "type": "string",
+                                    "description": "Jira issue key (e.g., 'PROJ-123')",
+                                },
+                                "transition_id": {
+                                    "type": "string",
+                                    "description": (
+                                        "ID of the transition to perform. Use the jira_get_transitions tool first "
+                                        "to get the available transition IDs for the issue. "
+                                        "Example values: '11', '21', '31'"
+                                    ),
+                                },
+                                "fields": {
+                                    "type": "string",
+                                    "description": (
+                                        "JSON string of fields to update during the transition. "
+                                        "Some transitions require specific fields to be set. "
+                                        'Example: \'{"resolution": {"name": "Fixed"}}\''
+                                    ),
+                                    "default": "{}",
+                                },
+                                "comment": {
+                                    "type": "string",
+                                    "description": (
+                                        "Comment to add during the transition (optional). "
+                                        "This will be visible in the issue history."
+                                    ),
+                                },
+                            },
+                            "required": ["issue_key", "transition_id"],
+                        },
+                    ),
+                ]
+            )
 
     return tools
 
@@ -764,6 +1016,10 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
     """Handle tool calls for Confluence and Jira operations."""
     ctx = app.request_context.lifespan_context
+
+    # Check if we're in read-only mode for write operations
+    read_only = is_read_only_mode()
+
     try:
         # Helper functions for formatting results
         def format_comment(comment: Any) -> dict:
@@ -777,13 +1033,27 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             }
 
         # Confluence operations
-        if name == "confluence_search":
+        if name == "confluence_search" and ctx and ctx.confluence:
             if not ctx or not ctx.confluence:
                 raise ValueError("Confluence is not configured.")
 
             query = arguments.get("query", "")
             limit = min(int(arguments.get("limit", 10)), 50)
-            pages = ctx.confluence.search(query, limit=limit)
+            spaces_filter = arguments.get("spaces_filter")
+
+            # Check if the query is a simple search term or already a CQL query
+            if query and not any(
+                x in query
+                for x in ["=", "~", ">", "<", " AND ", " OR ", "currentUser()"]
+            ):
+                # Convert simple search term to CQL text search
+                # This will search in all content (title, body, etc.)
+                query = f'text ~ "{query}"'
+                logger.info(f"Converting simple search term to CQL: {query}")
+
+            pages = ctx.confluence.search(
+                query, limit=limit, spaces_filter=spaces_filter
+            )
 
             # Format results using the to_simplified_dict method
             search_results = [page.to_simplified_dict() for page in pages]
@@ -795,22 +1065,27 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        elif name == "confluence_get_page":
+        elif name == "confluence_get_page" and ctx and ctx.confluence:
             if not ctx or not ctx.confluence:
                 raise ValueError("Confluence is not configured.")
 
             page_id = arguments.get("page_id")
             include_metadata = arguments.get("include_metadata", True)
+            convert_to_markdown = arguments.get("convert_to_markdown", True)
 
-            page = ctx.confluence.get_page_content(page_id)
+            page = ctx.confluence.get_page_content(
+                page_id, convert_to_markdown=convert_to_markdown
+            )
 
             if include_metadata:
+                # The to_simplified_dict method already includes the content,
+                # so we don't need to include it separately at the root level
                 result = {
-                    "content": page.page_content,
                     "metadata": page.to_simplified_dict(),
                 }
             else:
-                result = {"content": page.page_content}
+                # For backward compatibility, keep returning content directly
+                result = {"content": page.content}
 
             return [
                 TextContent(
@@ -818,7 +1093,64 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        elif name == "confluence_get_comments":
+        elif name == "confluence_get_page_children" and ctx and ctx.confluence:
+            if not ctx or not ctx.confluence:
+                raise ValueError("Confluence is not configured.")
+
+            parent_id = arguments.get("parent_id")
+            expand = arguments.get("expand", "version")
+            limit = min(int(arguments.get("limit", 25)), 50)
+            include_content = arguments.get("include_content", False)
+
+            # Add body.storage to expand if content is requested
+            if include_content and "body" not in expand:
+                expand = f"{expand},body.storage"
+
+            # Get the child pages
+            pages = ctx.confluence.get_page_children(
+                page_id=parent_id, expand=expand, limit=limit, convert_to_markdown=True
+            )
+
+            # Format results using the to_simplified_dict method
+            child_pages = [page.to_simplified_dict() for page in pages]
+
+            # Return the formatted results
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "parent_id": parent_id,
+                            "total": len(child_pages),
+                            "limit": limit,
+                            "results": child_pages,
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    ),
+                )
+            ]
+
+        elif name == "confluence_get_page_ancestors" and ctx and ctx.confluence:
+            if not ctx or not ctx.confluence:
+                raise ValueError("Confluence is not configured.")
+
+            page_id = arguments.get("page_id")
+
+            # Get the ancestor pages
+            ancestors = ctx.confluence.get_page_ancestors(page_id)
+
+            # Format results
+            ancestor_pages = [page.to_simplified_dict() for page in ancestors]
+
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(ancestor_pages, indent=2, ensure_ascii=False),
+                )
+            ]
+
+        elif name == "confluence_get_comments" and ctx and ctx.confluence:
             if not ctx or not ctx.confluence:
                 raise ValueError("Confluence is not configured.")
 
@@ -839,21 +1171,27 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             if not ctx or not ctx.confluence:
                 raise ValueError("Confluence is not configured.")
 
+            # Write operation - check read-only mode
+            if read_only:
+                return [
+                    TextContent(
+                        "Operation 'confluence_create_page' is not available in read-only mode."
+                    )
+                ]
+
             # Extract arguments
             space_key = arguments.get("space_key")
             title = arguments.get("title")
             content = arguments.get("content")
             parent_id = arguments.get("parent_id")
 
-            # Convert markdown to Confluence storage format
-            storage_format = markdown_to_confluence_storage(content)
-
-            # Create the page
+            # Create the page (with automatic markdown conversion)
             page = ctx.confluence.create_page(
                 space_key=space_key,
                 title=title,
-                body=storage_format,
+                body=content,
                 parent_id=parent_id,
+                is_markdown=True,
             )
 
             # Format the result
@@ -870,46 +1208,205 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             if not ctx or not ctx.confluence:
                 raise ValueError("Confluence is not configured.")
 
-            # Extract arguments
+            # Write operation - check read-only mode
+            if read_only:
+                return [
+                    TextContent(
+                        "Operation 'confluence_update_page' is not available in read-only mode."
+                    )
+                ]
+
             page_id = arguments.get("page_id")
             title = arguments.get("title")
             content = arguments.get("content")
             is_minor_edit = arguments.get("is_minor_edit", False)
             version_comment = arguments.get("version_comment", "")
 
-            # Convert markdown to Confluence storage format
-            storage_format = markdown_to_confluence_storage(content)
+            if not page_id or not title or not content:
+                raise ValueError(
+                    "Missing required parameters: page_id, title, and content are required."
+                )
 
-            # Update the page
-            page = ctx.confluence.update_page(
+            # Update the page (with automatic markdown conversion)
+            updated_page = ctx.confluence.update_page(
                 page_id=page_id,
                 title=title,
-                body=storage_format,
+                body=content,
                 is_minor_edit=is_minor_edit,
                 version_comment=version_comment,
+                is_markdown=True,
             )
 
-            # Format the result
-            result = page.to_simplified_dict()
+            # Format results
+            page_data = updated_page.to_simplified_dict()
+
+            return [TextContent(type="text", text=json.dumps({"page": page_data}))]
+
+        elif name == "confluence_delete_page":
+            if not ctx or not ctx.confluence:
+                raise ValueError("Confluence is not configured.")
+
+            # Write operation - check read-only mode
+            if read_only:
+                return [
+                    TextContent(
+                        "Operation 'confluence_delete_page' is not available in read-only mode."
+                    )
+                ]
+
+            page_id = arguments.get("page_id")
+
+            if not page_id:
+                raise ValueError("Missing required parameter: page_id is required.")
+
+            try:
+                # Delete the page
+                result = ctx.confluence.delete_page(page_id=page_id)
+
+                # Format results - our fixed implementation now correctly returns True on success
+                if result:
+                    response = {
+                        "success": True,
+                        "message": f"Page {page_id} deleted successfully",
+                    }
+                else:
+                    # This branch should rarely be hit with our updated implementation
+                    # but we keep it for safety
+                    response = {
+                        "success": False,
+                        "message": f"Unable to delete page {page_id}. The API request completed but deletion was unsuccessful.",
+                    }
+
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps(response, indent=2, ensure_ascii=False),
+                    )
+                ]
+            except Exception as e:
+                # API call failed with an exception
+                logger.error(f"Error deleting Confluence page {page_id}: {str(e)}")
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "success": False,
+                                "message": f"Error deleting page {page_id}",
+                                "error": str(e),
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                    )
+                ]
+
+        elif name == "confluence_upload_attachment":
+            if not ctx or not ctx.confluence:
+                raise ValueError("Confluence is not configured.")
+
+            page_id = arguments.get("page_id")
+            file_path = arguments.get("file_path")
+            comment = arguments.get("comment")
+
+            if not page_id or not file_path:
+                raise ValueError("Both page_id and file_path are required.")
+
+            attachment = ctx.confluence.attach_file(
+                page_id=page_id,
+                file_path=file_path,
+                comment=comment
+            )
 
             return [
                 TextContent(
                     type="text",
-                    text=f"Page updated successfully:\n{json.dumps(result, indent=2, ensure_ascii=False)}",
+                    text=json.dumps(attachment.to_simplified_dict(), indent=2, ensure_ascii=False),
+                )
+            ]
+
+        elif name == "confluence_get_attachments":
+            if not ctx or not ctx.confluence:
+                raise ValueError("Confluence is not configured.")
+
+            page_id = arguments.get("page_id")
+            start = int(arguments.get("start", 0))
+            limit = min(int(arguments.get("limit", 50)), 100)
+
+            if not page_id:
+                raise ValueError("page_id is required.")
+
+            attachments = ctx.confluence.get_attachments(
+                page_id=page_id,
+                start=start,
+                limit=limit
+            )
+
+            # Format results using the to_simplified_dict method
+            attachment_results = [attachment.to_simplified_dict() for attachment in attachments]
+
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(attachment_results, indent=2, ensure_ascii=False),
+                )
+            ]
+
+        elif name == "confluence_delete_attachment":
+            if not ctx or not ctx.confluence:
+                raise ValueError("Confluence is not configured.")
+
+            # Write operation - check read-only mode
+            if read_only:
+                return [
+                    TextContent(
+                        type="text",
+                        text="Operation 'confluence_delete_attachment' is not available in read-only mode.",
+                    )
+                ]
+
+            page_id = arguments.get("page_id")
+            filename = arguments.get("filename")
+
+            if not page_id or not filename:
+                raise ValueError("Both page_id and filename are required.")
+
+            success = ctx.confluence.delete_attachment_by_filename(
+                page_id=page_id, filename=filename
+            )
+
+            result = {
+                "success": success,
+                "message": f"Attachment '{filename}' on page {page_id} {'deleted successfully' if success else 'deletion failed'}",
+            }
+            return [
+                TextContent(
+                    type="text", text=json.dumps(result, indent=2, ensure_ascii=False)
                 )
             ]
 
         # Jira operations
-        elif name == "jira_get_issue":
+        elif name == "jira_get_issue" and ctx and ctx.jira:
             if not ctx or not ctx.jira:
                 raise ValueError("Jira is not configured.")
 
             issue_key = arguments.get("issue_key")
+            fields = arguments.get(
+                "fields",
+                "summary,description,status,assignee,reporter,labels,priority,created,updated,issuetype",
+            )
             expand = arguments.get("expand")
-            comment_limit = arguments.get("comment_limit")
+            comment_limit = arguments.get("comment_limit", 10)
+            properties = arguments.get("properties")
+            update_history = arguments.get("update_history", True)
 
             issue = ctx.jira.get_issue(
-                issue_key, expand=expand, comment_limit=comment_limit
+                issue_key,
+                fields=fields,
+                expand=expand,
+                comment_limit=comment_limit,
+                properties=properties,
+                update_history=update_history,
             )
 
             result = {"content": issue.to_simplified_dict()}
@@ -920,15 +1417,21 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        elif name == "jira_search":
+        elif name == "jira_search" and ctx and ctx.jira:
             if not ctx or not ctx.jira:
                 raise ValueError("Jira is not configured.")
 
             jql = arguments.get("jql")
-            fields = arguments.get("fields", "*all")
+            fields = arguments.get(
+                "fields",
+                "summary,description,status,assignee,reporter,labels,priority,created,updated,issuetype",
+            )
             limit = min(int(arguments.get("limit", 10)), 50)
+            projects_filter = arguments.get("projects_filter")
 
-            issues = ctx.jira.search_issues(jql, fields=fields, limit=limit)
+            issues = ctx.jira.search_issues(
+                jql, fields=fields, limit=limit, projects_filter=projects_filter
+            )
 
             # Format results using the to_simplified_dict method
             search_results = [issue.to_simplified_dict() for issue in issues]
@@ -940,7 +1443,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        elif name == "jira_get_project_issues":
+        elif name == "jira_get_project_issues" and ctx and ctx.jira:
             if not ctx or not ctx.jira:
                 raise ValueError("Jira is not configured.")
 
@@ -959,9 +1462,106 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
+        elif name == "jira_get_epic_issues" and ctx and ctx.jira:
+            if not ctx or not ctx.jira:
+                raise ValueError("Jira is not configured.")
+
+            epic_key = arguments.get("epic_key")
+            limit = min(int(arguments.get("limit", 10)), 50)
+
+            # Get issues linked to the epic
+            issues = ctx.jira.get_epic_issues(epic_key, limit=limit)
+
+            # Format results
+            epic_issues = [issue.to_simplified_dict() for issue in issues]
+
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(epic_issues, indent=2, ensure_ascii=False),
+                )
+            ]
+
+        elif name == "jira_get_transitions" and ctx and ctx.jira:
+            if not ctx or not ctx.jira:
+                raise ValueError("Jira is not configured.")
+
+            issue_key = arguments.get("issue_key")
+
+            # Get available transitions
+            transitions = ctx.jira.get_available_transitions(issue_key)
+
+            # Format transitions
+            formatted_transitions = []
+            for transition in transitions:
+                formatted_transitions.append(
+                    {
+                        "id": transition.get("id"),
+                        "name": transition.get("name"),
+                        "to_status": transition.get("to", {}).get("name"),
+                    }
+                )
+
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        formatted_transitions, indent=2, ensure_ascii=False
+                    ),
+                )
+            ]
+
+        elif name == "jira_get_worklog" and ctx and ctx.jira:
+            if not ctx or not ctx.jira:
+                raise ValueError("Jira is not configured.")
+
+            issue_key = arguments.get("issue_key")
+
+            # Get worklogs
+            worklogs = ctx.jira.get_worklogs(issue_key)
+
+            result = {"worklogs": worklogs}
+
+            return [
+                TextContent(
+                    type="text", text=json.dumps(result, indent=2, ensure_ascii=False)
+                )
+            ]
+
+        elif name == "jira_download_attachments" and ctx and ctx.jira:
+            if not ctx or not ctx.jira:
+                raise ValueError("Jira is not configured.")
+
+            issue_key = arguments.get("issue_key")
+            target_dir = arguments.get("target_dir")
+
+            if not issue_key:
+                raise ValueError("Missing required parameter: issue_key")
+            if not target_dir:
+                raise ValueError("Missing required parameter: target_dir")
+
+            # Download the attachments
+            result = ctx.jira.download_issue_attachments(
+                issue_key=issue_key, target_dir=target_dir
+            )
+
+            return [
+                TextContent(
+                    type="text", text=json.dumps(result, indent=2, ensure_ascii=False)
+                )
+            ]
+
         elif name == "jira_create_issue":
             if not ctx or not ctx.jira:
                 raise ValueError("Jira is not configured.")
+
+            # Write operation - check read-only mode
+            if read_only:
+                return [
+                    TextContent(
+                        "Operation 'jira_create_issue' is not available in read-only mode."
+                    )
+                ]
 
             # Extract required arguments
             project_key = arguments.get("project_key")
@@ -1002,6 +1602,14 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         elif name == "jira_update_issue":
             if not ctx or not ctx.jira:
                 raise ValueError("Jira is not configured.")
+
+            # Write operation - check read-only mode
+            if read_only:
+                return [
+                    TextContent(
+                        "Operation 'jira_update_issue' is not available in read-only mode."
+                    )
+                ]
 
             # Extract arguments
             issue_key = arguments.get("issue_key")
@@ -1049,6 +1657,14 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             if not ctx or not ctx.jira:
                 raise ValueError("Jira is not configured.")
 
+            # Write operation - check read-only mode
+            if read_only:
+                return [
+                    TextContent(
+                        "Operation 'jira_delete_issue' is not available in read-only mode."
+                    )
+                ]
+
             issue_key = arguments.get("issue_key")
 
             # Delete the issue
@@ -1066,6 +1682,14 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             if not ctx or not ctx.jira:
                 raise ValueError("Jira is not configured.")
 
+            # Write operation - check read-only mode
+            if read_only:
+                return [
+                    TextContent(
+                        "Operation 'jira_add_comment' is not available in read-only mode."
+                    )
+                ]
+
             issue_key = arguments.get("issue_key")
             comment = arguments.get("comment")
 
@@ -1081,6 +1705,14 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         elif name == "jira_add_worklog":
             if not ctx or not ctx.jira:
                 raise ValueError("Jira is not configured.")
+
+            # Write operation - check read-only mode
+            if read_only:
+                return [
+                    TextContent(
+                        "Operation 'jira_add_worklog' is not available in read-only mode."
+                    )
+                ]
 
             # Extract arguments
             issue_key = arguments.get("issue_key")
@@ -1104,26 +1736,17 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        elif name == "jira_get_worklog":
-            if not ctx or not ctx.jira:
-                raise ValueError("Jira is not configured.")
-
-            issue_key = arguments.get("issue_key")
-
-            # Get worklogs
-            worklogs = ctx.jira.get_worklogs(issue_key)
-
-            result = {"worklogs": worklogs}
-
-            return [
-                TextContent(
-                    type="text", text=json.dumps(result, indent=2, ensure_ascii=False)
-                )
-            ]
-
         elif name == "jira_link_to_epic":
             if not ctx or not ctx.jira:
                 raise ValueError("Jira is not configured.")
+
+            # Write operation - check read-only mode
+            if read_only:
+                return [
+                    TextContent(
+                        "Operation 'jira_link_to_epic' is not available in read-only mode."
+                    )
+                ]
 
             issue_key = arguments.get("issue_key")
             epic_key = arguments.get("epic_key")
@@ -1142,58 +1765,17 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        elif name == "jira_get_epic_issues":
-            if not ctx or not ctx.jira:
-                raise ValueError("Jira is not configured.")
-
-            epic_key = arguments.get("epic_key")
-            limit = min(int(arguments.get("limit", 10)), 50)
-
-            # Get issues linked to the epic
-            issues = ctx.jira.get_epic_issues(epic_key, limit=limit)
-
-            # Format results
-            epic_issues = [issue.to_simplified_dict() for issue in issues]
-
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(epic_issues, indent=2, ensure_ascii=False),
-                )
-            ]
-
-        elif name == "jira_get_transitions":
-            if not ctx or not ctx.jira:
-                raise ValueError("Jira is not configured.")
-
-            issue_key = arguments.get("issue_key")
-
-            # Get available transitions
-            transitions = ctx.jira.get_available_transitions(issue_key)
-
-            # Format transitions
-            formatted_transitions = []
-            for transition in transitions:
-                formatted_transitions.append(
-                    {
-                        "id": transition.get("id"),
-                        "name": transition.get("name"),
-                        "to_status": transition.get("to", {}).get("name"),
-                    }
-                )
-
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(
-                        formatted_transitions, indent=2, ensure_ascii=False
-                    ),
-                )
-            ]
-
         elif name == "jira_transition_issue":
             if not ctx or not ctx.jira:
                 raise ValueError("Jira is not configured.")
+
+            # Write operation - check read-only mode
+            if read_only:
+                return [
+                    TextContent(
+                        "Operation 'jira_transition_issue' is not available in read-only mode."
+                    )
+                ]
 
             # Extract arguments
             issue_key = arguments.get("issue_key")
@@ -1269,16 +1851,43 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
 
-async def main() -> None:
-    """Run the MCP Atlassian server."""
-    # Import here to avoid issues with event loops
-    from mcp.server.stdio import stdio_server
+async def run_server(transport: str = "stdio", port: int = 8000) -> None:
+    """Run the MCP Atlassian server with the specified transport."""
+    if transport == "sse":
+        from mcp.server.sse import SseServerTransport
+        from starlette.applications import Starlette
+        from starlette.requests import Request
+        from starlette.routing import Mount, Route
 
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+        sse = SseServerTransport("/messages/")
 
+        async def handle_sse(request: Request) -> None:
+            async with sse.connect_sse(
+                request.scope, request.receive, request._send
+            ) as streams:
+                await app.run(
+                    streams[0], streams[1], app.create_initialization_options()
+                )
 
-if __name__ == "__main__":
-    import asyncio
+        starlette_app = Starlette(
+            debug=True,
+            routes=[
+                Route("/sse", endpoint=handle_sse),
+                Mount("/messages/", app=sse.handle_post_message),
+            ],
+        )
 
-    asyncio.run(main())
+        import uvicorn
+
+        # Set up uvicorn config
+        config = uvicorn.Config(starlette_app, host="0.0.0.0", port=port)  # noqa: S104
+        server = uvicorn.Server(config)
+        # Use server.serve() instead of run() to stay in the same event loop
+        await server.serve()
+    else:
+        from mcp.server.stdio import stdio_server
+
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(
+                read_stream, write_stream, app.create_initialization_options()
+            )

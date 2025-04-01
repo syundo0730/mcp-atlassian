@@ -9,9 +9,10 @@ from .config import ConfluenceConfig
 from .pages import PagesMixin
 from .search import SearchMixin
 from .spaces import SpacesMixin
+from .attachments import AttachmentsMixin
 
 
-class ConfluenceFetcher(SearchMixin, SpacesMixin, PagesMixin, CommentsMixin):
+class ConfluenceFetcher(SearchMixin, SpacesMixin, PagesMixin, CommentsMixin, AttachmentsMixin):
     """Main entry point for Confluence operations, providing backward compatibility.
 
     This class combines functionality from various mixins to maintain the same
