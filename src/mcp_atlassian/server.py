@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from mcp.server import Server
-from mcp.types import Resource, TextContent, Tool
+from mcp.types import Resource, TextContent, Tool, Prompt, PromptMessage, GetPromptResult
 
 from .confluence import ConfluenceFetcher
 from .jira import JiraFetcher
@@ -107,6 +107,41 @@ async def server_lifespan(server: Server) -> AsyncIterator[AppContext]:
 
 # Create server instance
 app = Server("mcp-atlassian", lifespan=server_lifespan)
+
+
+@app.list_prompts()
+async def list_prompts() -> list[Prompt]:
+    """List available prompts."""
+    return [
+        Prompt(
+            name="confluence_image_storage_format",
+            description="Format to insert images into Confluence pages",
+        )
+    ]
+
+
+@app.get_prompt()
+async def get_prompt(name: str, arguments: dict[str, str] | None = None) -> GetPromptResult:
+    """Get a prompt."""
+    if name == "confluence_image_storage_format":
+        return GetPromptResult(
+            messages=[
+                PromptMessage(
+                    role="user",
+                    content=TextContent(
+                        type="text",
+                        text="""use this confluence image storage format to insert the image into the page
+                        <ac:image ac:align="center" ac:layout="center" ac:original-height="387" 
+                        ac:original-width="607" ac:custom-width="true" ac:alt="image-20241203-032414.png" 
+                        ac:width="363">
+                        <ri:attachment ri:filename="image-20241203-032414.png" ri:version-at-save="1" />
+                        </ac:image>"""
+                    ),
+                )
+            ]
+        )
+
+    raise ValueError(f"Prompt {name}'s implementation is not found")
 
 
 # Implement server handlers
